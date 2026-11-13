@@ -1205,3 +1205,31 @@ Nothing removed. Issue #27: the `screenshot` page tool returned device-px PNGs (
   checked before the capture, released when the result is sent); reads and rescales run on one sequence. Probe
   `smoke-page-tools.mjs` (own 2x launch in `smoke-all`): a noise page whose 2x PNG is over 10 MiB returns images (CSS,
   device + maxSize 1568), device PNG is a clear error, a burst of six gets "Busy" for the extras, no files left.
+
+## Fork commit 61 (2026-11-13): per-agent proxy
+
+Nothing removed. New: every agent can have its own proxy (plan "Proxy theo agent profile cho Shuttle"; design and limits
+in `FEATURES.md` row 61 and `MCP.md`). Branch `sh/profile-proxy`. Written and reviewed on a host that cannot build
+Chromium (two read-only Oracle reviews: compile/GN/mojo lifetime, and leaks/secrets); **not yet compiled**: the first
+Linux `gn gen` + build is the open item.
+- New `agent_proxy` source_set in `chrome/browser/shuttle/` (called by the network stack, so no dependency on
+  `ShuttleService`): `agent_proxy.{h,cc}` (`ProxySpec`: http, https, socks5 without auth; socks4 refused because it
+  resolves DNS locally; parse/validate, redaction, password encrypted with `os_crypt_async`, fail-closed config for an
+  unreadable stored proxy), `ProfileProxyService` + factory (storage in the agent's `shuttle.profiles` entry, memory for
+  throwaway agents; live change through the agent partition's `ProxyConfigClient`, then close connections and clear the
+  host cache; follows the system proxy while an agent has none), `proxy_auth.{h,cc}` (407 answered with the agent's
+  credentials, never a dialog; wrong password detected per request through `first_auth_attempt`, 60 s backoff; WebRTC
+  `disable_non_proxied_udp` and cleared per-URL rules for proxied agent tabs), `proxy_tab_sync.{h,cc}` in `:impl`
+  (re-syncs open tabs on a proxy change), `proxy_check.{h,cc}` (`test-proxy`).
+- Upstream touch points (10): `chrome_content_browser_client.cc` (login hook), `ui/prefs/prefs_tab_helper.cc`,
+  `preloading/preloading_prefs.cc` (`net.network_prediction_options` now defaults to disabled: same-site prefetch uses the
+  default network context, outside the agent proxy), `net/profile_network_context_service{,_factory}.cc`,
+  `profiles/chrome_browser_main_extra_parts_profiles.cc`, and four GN files.
+- MCP: `proxy` on `create-agent` / `update-agent` / `list-agents` (redacted), `set-proxy-all`, `assign-proxies`,
+  `test-proxy` (public http(s) targets only, no redirects). `ShuttleService::profile()` added.
+- Probe `smoke-proxy.mjs` (own launch in `smoke-all`; written, never run).
+- Review decisions worth keeping: Chromium's implicit proxy bypass (localhost, loopback, link-local) stays (machine-local
+  destinations); an all-match bypass entry is refused; WebRTC in workers cannot be attributed to an agent (known gap);
+  agent attribution parses the partition path (`Storage/ext/shuttle-<id>/def`), so an upstream layout change makes agents
+  lose their proxy silently (smoke-proxy catches it); on headless Linux without a keyring `os_crypt` uses a fixed key, so
+  the stored password is obfuscated, not secret.

@@ -42,3 +42,63 @@ Own code lives in `chrome/browser/shuttle/` (MCP server, sessions, agents, page 
 | 55 | CDP `Target.closeTarget` / `Page.close` on the home tab reply an error (no false success); Shuttle icon on `chrome://agents` | `5eab0d8236` | 5: devtools inspector_protocol_config.json, protocol target_handler + page_handler, chrome_web_ui_controller_factory.cc + webui BUILD.gn | smoke-home-tab (2, 5b, 7); icon seen by Toby | REMOVAL-LOG |
 | 56 | Session lifetime: CDP-created tabs close with their connection; idle timeout (30 min default, `--shuttle-session-idle-timeout`), `update-session`, `open-session` warning | `1a8b1958bd` | 0: own code in `chrome/browser/shuttle/` only | smoke-tab-guards; sidecar restart checked by hand | REMOVAL-LOG |
 | 59 | Throwaway agents: `create-agent { throwaway: true, idleMinutes? }`, in-memory storage, deleted after `idleMinutes` idle (default 15) with their tabs and save-text files, cap 50 (`--shuttle-max-throwaway-agents`), "Temporary" chip on `chrome://agents` | (pending) | 0: own code in `chrome/browser/shuttle/` and `resources/agents/`; `agent_partition.cc` (used by chrome_content_browser_client, browser_navigator) accepts in-memory `shuttle-tmp-` partitions | smoke-throwaway | REMOVAL-LOG, MCP.md |
+| 61 | Per-agent proxy: each agent has its own proxy (http, https, socks5; socks4 and SOCKS with auth refused), password encrypted at rest, live change, HTTP 407 answered automatically, WebRTC leak guards for proxied agent tabs, fail-closed for an unreadable stored proxy; MCP `proxy` fields, `set-proxy-all`, `assign-proxies`, `test-proxy` | (pending) | 10: chrome_content_browser_client.cc (CreateLoginDelegate hook; comment at UpdateRendererPreferencesForWorker), ui/prefs/prefs_tab_helper.cc (2 ApplyAgentRendererPrefs calls), preloading/preloading_prefs.cc (net.network_prediction_options default disabled), net/profile_network_context_service.cc + _factory.cc (proxy hook, DependsOn), profiles/chrome_browser_main_extra_parts_profiles.cc (factory registration, OSCryptAsync pointer); GN: chrome/browser/BUILD.gn, net/BUILD.gn, profiles/BUILD.gn, ui/prefs/BUILD.gn; new `agent_proxy` source_set in chrome/browser/shuttle/BUILD.gn | smoke-proxy (WebRTC: SKIP when not decidable offline) | MCP.md, this section |
+
+## Per-agent proxy (fork 61)
+
+- **What it adds:** a proxy stored per agent (`shuttle.profiles` entry, key `proxy`; none = the system proxy as
+  before). No default and no inheritance: `set-proxy-all` and `assign-proxies` write copies. Changes apply live: the
+  agent's NetworkContext gets the new config, connections are closed and the host cache cleared, so the next request
+  of an open tab uses it. Throwaway agents keep their proxy in memory only.
+- **Upstream touch points:** `chrome/browser/net/profile_network_context_service.cc` (the config hook for agent
+  partitions; `proxy_config_monitor_` stays for agents without a proxy), `chrome/browser/chrome_content_browser_client.cc`
+  (login delegate answering proxy challenges for agent tabs; renderer prefs: `disable_non_proxied_udp` for WebRTC
+  in tabs of a proxied agent), new `source_set("agent_proxy")` in `chrome/browser/shuttle/BUILD.gn`.
+- **Fail closed:** a stored proxy that can't be read (corrupt, password not decryptable) makes the agent's traffic
+  fail, never go direct.
+- **Passwords:** encrypted with `os_crypt` before they reach the pref; never returned by MCP (`hasPassword` only), logs
+  or errors. Caveat: on headless Linux without a keyring `os_crypt` uses a built-in key, so the stored password is
+  obfuscated, not secret, against a reader of the profile.
+- **Schemes:** `http`, `https`, `socks5` only. socks4 is refused ("socks4 is not supported (it resolves DNS locally); use
+  socks5"): it resolves destination names locally, a leak. SOCKS with credentials is refused ("SOCKS proxy with
+  authentication is not supported"). Refusals apply to every tool that takes a proxy and write nothing.
+- **Bypass:** a bypass entry matching every host is refused ("A bypass entry that matches every host is not allowed").
+- **Auth:** HTTP/HTTPS proxy challenges are answered from the stored credentials (no dialog). A wrong password is
+  detected per request (`first_auth_attempt`); the rejection marks the agent failed and starts a 60 s backoff in which
+  no credentials are sent. Changing the agent's proxy clears the backoff; `test-proxy` resets it at its start.
+- **WebRTC and speculative loads:** for an agent with a proxy the WebRTC policy is `disable_non_proxied_udp`, the
+  profile's per-URL `webrtc_ip_handling_urls` rules are cleared for those tabs, and prefetch/prerender/preconnect are
+  disabled for agent tabs with a proxy.
+- **Known gaps:** SOCKS auth and socks4 unsupported (no relay); the external MCP profile manager (server "shuttle" with
+  `profileId`) does not pass `proxy`; no UI yet (`chrome://agents` proxy form is later work).
+
+### Scope and known limits
+
+- **Guarantee scope:** requests made through the agent's StoragePartition (pages, subresources, workers' fetches).
+  Not covered: browser-level network contexts (component updater, metrics, Safe Browsing if present); speculative
+  requests that use the default network context, unless disabled for proxied agent tabs; WebRTC in workers (worker
+  renderer prefs cannot be attributed to an agent: known gap).
+- **Speculative loading:** Shuttle defaults `net.network_prediction_options` to disabled for the whole browser (prefetch,
+  prerender, preconnect, predictor). Reason: same-site prefetch uses the default network context, not the agent proxy.
+  Residual: an explicitly stored value, an extension or an enterprise policy can re-enable it, and then same-site
+  prefetch can bypass the agent proxy. Page hints `<link rel=preconnect|dns-prefetch>` and legacy
+  `<link rel=prefetch|preload|modulepreload>` were checked: they run on the page's own (agent) network context, so they
+  use the agent proxy.
+- **Implicit bypass:** `localhost`, `*.localhost`, loopback, and link-local (169.254/16, fe80::/10) are never proxied
+  (destinations on the machine itself; they don't reveal the external IP). Accepted upstream behavior.
+- **In flight:** requests in flight when a proxy changes are ended by closing their connections; new requests use the
+  new proxy.
+- **Attribution:** an agent is recognized by its partition path (`Storage/ext/shuttle-<id>/def`). If upstream changes
+  that layout, agents silently lose per-agent proxy handling; smoke-mcp phase 2 and smoke-proxy catch it.
+- **Trust:** MCP is a trusted local control plane. `set-proxy-all`, `assign-proxies` and `test-proxy` act on any agent;
+  the browser-wide network-mode token is the only authorization, as for every other tool. `test-proxy` adds no authority
+  beyond driving a tab and still only reaches public http(s) targets (no loopback, localhost, private or link-local IP
+  literals, no userinfo, no redirects).
+- **Encryption:** `os_crypt` on headless Linux without a keyring uses a fixed built-in key: the stored password is
+  obfuscated, not secret from anyone who can read the profile directory. With a keyring it is protected by it. A
+  password proxy created while OS encryption is not ready is refused (tool error), never stored in plaintext; at
+  startup, before encryption is ready, such agents run fail-closed until it is.
+- **Probe:** `scripts/smoke-proxy.mjs <port> <udd>` (own launch in `smoke-all.sh`): local origin plus HTTP, auth-HTTP and
+  SOCKS5 proxies; checks routing per agent, live change, refusals, `set-proxy-all`, `assign-proxies`, 407 handling,
+  throwaway, password absence (MCP output and Preferences), `test-proxy` shapes and WebRTC. The fail-closed case is a
+  SKIP here (needs a tampered profile).

@@ -153,6 +153,40 @@ restart", delete (storage wiped), end session,
 focus a tab, "Open tab" (foreground tab in the agent's storage, e.g. to sign in). Calls the MCP tools via
 `chrome.send('callTool')` (allowlisted in `build_webui.gni` `legacy_chrome_send_users`).
 
+## Per-agent proxy
+
+Each agent can send its traffic through its own proxy (`docs/FEATURES.md` "Per-agent proxy"; probe `smoke-proxy.mjs`).
+A proxy is a string `scheme://[user[:password]@]host:port` (`http`, `https`, `socks5`) or an object
+`{scheme, host, port, username?, password?, bypass?: [string]}` (`bypass` in net::ProxyBypassRules syntax; an entry
+matching every host is refused). `null` = no proxy (system proxy, as before). Refused: socks4 ("resolves DNS locally;
+use socks5") and SOCKS with a username or password ("SOCKS proxy with authentication is not supported").
+
+- `create-agent {…, proxy?}` (also with `throwaway: true`; the throwaway proxy lives in memory only).
+- `update-agent {id, proxy?}`: a value sets it, `null` clears it. Applies live: the next request of an open tab uses it.
+- `list-agents`: `proxy` is `null`, `{scheme, host, port, username?, hasPassword, bypass?}` or `{unreadable: true}`
+  (a stored proxy that can't be read; the agent then fails closed, it never goes direct). The password is never returned.
+- `set-proxy-all {proxy, agentIds?}`: copies one proxy into every persistent agent (or the listed ones); `proxy: null`
+  clears. Returns `{updated: [agentId]}`. Each agent keeps its own copy; later edits don't touch the others.
+- `assign-proxies {proxies: [proxy], agentIds?, reuse?}`: one proxy per agent, in order (default agents: persistent,
+  by creation then id). Fewer proxies: the rest stay as they are and are listed in `unchanged`; `reuse: true` cycles
+  through the list. More: the extras are listed in `unused`. Any bad entry fails the whole call with an error that names
+  `proxies[i]`, and nothing is written. Returns `{assigned: [{agentId, proxy}], unchanged, unused}` (proxies redacted).
+- `test-proxy {agentId, url?}`: loads `url` (default `https://api.ipify.org?format=json`) through the agent's own
+  network context. Returns `{agentId, ok, latencyMs, status?, body?, proxy?, error?: {code, message, proxyAuthFailed?}}`.
+  `proxyAuthFailed` is true after a 407 with the stored password refused. Targets: public http(s) only (loopback,
+  localhost, private and link-local IP literals and userinfo URLs are refused; no redirects).
+- HTTP/HTTPS proxy auth (407) is answered automatically with the stored credentials, no dialog. A wrong password is
+  detected per request; the agent then sends no credentials for 60 s (changing its proxy or running `test-proxy`
+  resets this).
+- WebRTC: tabs of an agent with a proxy use `disable_non_proxied_udp`, their per-URL WebRTC rules are cleared, and
+  prefetch/prerender/preconnect are disabled for them.
+
+Limits (`docs/FEATURES.md` "Scope and known limits"): covers requests through the agent's own storage partition, not
+browser-level traffic or WebRTC in workers. `localhost` and loopback are never proxied (Chromium's implicit bypass). Speculative loading (prefetch, prerender,
+preconnect) is disabled by default; an explicit setting or policy can re-enable same-site prefetch outside the proxy.
+In-flight requests end when the proxy changes; new ones use the new proxy. The MCP is a trusted local control plane:
+the network-mode token is the only authorization.
+
 ## Open
 
 - `outerWidth/outerHeight` report the window, not the resized tab viewport (detectable mismatch).
