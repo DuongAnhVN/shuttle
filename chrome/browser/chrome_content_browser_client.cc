@@ -158,6 +158,7 @@
 #include "chrome/browser/service_worker/service_worker_prewarm.h"
 #include "chrome/browser/service_worker/service_worker_synthetic_response.h"
 #include "chrome/browser/shuttle/agent_partition.h"
+#include "chrome/browser/shuttle/proxy_auth.h"
 #include "chrome/browser/site_protection/site_familiarity_process_selection_deferring_condition.h"
 #include "chrome/browser/site_protection/site_familiarity_process_selection_user_data.h"
 #include "chrome/browser/site_protection/site_familiarity_utils.h"
@@ -2820,6 +2821,10 @@ void ChromeContentBrowserClient::UpdateRendererPreferencesForWorker(
     blink::RendererPreferences* out_prefs) {
   DCHECK(browser_context);
   DCHECK(out_prefs);
+  // No shuttle::ApplyAgentRendererPrefs here: this hook gets only the
+  // BrowserContext, not the storage partition or WebContents, so the agent of
+  // a shared/service worker cannot be attributed. Such workers get the
+  // profile's WebRTC policy. Known gap of the per-agent proxy.
   renderer_preferences_util::UpdateFromSystemSettings(
       out_prefs, Profile::FromBrowserContext(browser_context));
 }
@@ -6321,6 +6326,19 @@ ChromeContentBrowserClient::CreateLoginDelegate(
     bool do_not_prompt_for_login,
     content::GuestPageHolder* guest,
     content::LoginDelegate::LoginAuthRequiredCallback auth_required_callback) {
+  // Shuttle: a proxy challenge of an agent tab never shows a login dialog (the
+  // agent is driven by MCP and can't answer it), whatever
+  // do_not_prompt_for_login says. The agent's own credentials answer the first
+  // challenge of a request; a refused second one fails the request.
+  if (auth_info.is_proxy) {
+    std::string agent_id = shuttle::AgentIdForWebContents(web_contents);
+    if (!agent_id.empty()) {
+      return shuttle::CreateAgentProxyLoginDelegate(
+          Profile::FromBrowserContext(browser_context), agent_id, auth_info,
+          first_auth_attempt, std::move(auth_required_callback));
+    }
+  }
+
 #if BUILDFLAG(IS_CHROMEOS)
   // Negotiate challenge is handled via GSSAPI library, which can not receive
   // external credentials. However, on ChromeOS we can suggest the user to

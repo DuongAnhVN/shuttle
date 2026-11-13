@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <map>
 #include <optional>
+#include <set>
 #include <utility>
+#include <vector>
 
 #include "base/base64.h"
 #include "base/functional/bind.h"
@@ -20,14 +22,20 @@
 #include "base/strings/utf_string_conversions.h"
 #include "base/time/time.h"
 #include "base/timer/timer.h"
-#include "chrome/browser/shuttle/shuttle_service.h"
+#include "chrome/browser/profiles/profile.h"
+#include "chrome/browser/shuttle/agent_proxy.h"
 #include "chrome/browser/shuttle/network_access.h"
+#include "chrome/browser/shuttle/profile_proxy_service.h"
+#include "chrome/browser/shuttle/profile_proxy_service_factory.h"
 #include "chrome/browser/shuttle/profile_registry.h"
+#include "chrome/browser/shuttle/proxy_check.h"
 #include "chrome/browser/shuttle/session_manager.h"
+#include "chrome/browser/shuttle/shuttle_service.h"
 #include "components/viz/common/frame_sinks/copy_output_result.h"
 #include "content/public/browser/navigation_controller.h"
 #include "content/public/browser/navigation_handle.h"
 #include "content/public/browser/render_widget_host_view.h"
+#include "content/public/browser/storage_partition.h"
 #include "content/public/browser/web_contents.h"
 #include "content/public/browser/web_contents_observer.h"
 #include "net/base/net_errors.h"
@@ -120,6 +128,25 @@ std::optional<base::TimeDelta> GetIdleTimeout(const base::DictValue& args,
   return base::Minutes(*minutes);
 }
 
+// An optional boolean argument `key`: `*value` is false when absent. Returns
+// false, with `error` set, when present but not a boolean.
+bool GetBoolArg(const base::DictValue& args,
+                std::string_view key,
+                bool* value,
+                std::string* error) {
+  *value = false;
+  const base::Value* arg = args.Find(key);
+  if (!arg) {
+    return true;
+  }
+  if (!arg->is_bool()) {
+    *error = base::StrCat({key, " must be a boolean"});
+    return false;
+  }
+  *value = arg->GetBool();
+  return true;
+}
+
 // Resolves `targetId` to a tab leased to some session.
 content::WebContents* GetLeasedTab(const base::DictValue& args,
                                    std::string* error) {
@@ -152,6 +179,163 @@ std::optional<gfx::Size> GetViewport(const base::DictValue& args,
 
 // Agents --------------------------------------------------------------------
 
+constexpr char kNoProxyService[] = "Per-agent proxies are not available here";
+
+// Null if the profile has no agents.
+ProfileProxyService* ProxyServiceOf(const ToolContext& context) {
+  return ProfileProxyServiceFactory::GetForProfile(context.service->profile());
+}
+
+// null (no proxy), the redacted proxy, or {unreadable: true} when the stored
+// proxy can't be read. Never the password.
+base::Value DescribeProxy(const ToolContext& context, const std::string& id) {
+  ProfileProxyService* service = ProxyServiceOf(context);
+  if (!service) {
+    return base::Value();
+  }
+  StoredProxy stored = service->Lookup(id);
+  switch (stored.state) {
+    case StoredProxy::State::kProxy:
+      return base::Value(ProxyToRedactedValue(*stored.spec));
+    case StoredProxy::State::kCorrupt:
+      return base::Value(base::DictValue().Set("unreadable", true));
+    case StoredProxy::State::kNone:
+      return base::Value();
+  }
+  return base::Value();
+}
+
+// The optional `proxy` argument of create-agent and update-agent.
+struct ProxyChange {
+  // False when the argument is absent: the agent's proxy is left alone.
+  bool present = false;
+  // Unset when the argument is null: the proxy is cleared.
+  std::optional<ProxySpec> proxy;
+};
+
+// Reads `proxy` from `args`. Errors are prefixed with "proxy: ".
+bool GetProxyChange(const base::DictValue& args,
+                    ProxyChange* change,
+                    std::string* error) {
+  *change = ProxyChange();
+  const base::Value* value = args.Find("proxy");
+  if (!value) {
+    return true;
+  }
+  change->present = true;
+  if (value->is_none()) {
+    return true;
+  }
+  ProxySpec spec;
+  *error = ParseProxyValue(*value, &spec);
+  if (!error->empty()) {
+    *error = "proxy: " + *error;
+    return false;
+  }
+  change->proxy = std::move(spec);
+  return true;
+}
+
+// "" if `change` can be applied: a proxy needs the proxy service.
+std::string CheckProxyChange(const ToolContext& context,
+                             const ProxyChange& change) {
+  if (change.present && !ProxyServiceOf(context)) {
+    return kNoProxyService;
+  }
+  return std::string();
+}
+
+constexpr char kPasswordNotReady[] =
+    "Cannot store the proxy password right now (OS encryption is not ready); "
+    "try again, or use a proxy without a password";
+
+// Whether storing `proxy` for agent `id` needs the OS encryptor: a password of
+// a persistent agent (a throwaway agent's proxy stays in memory).
+bool NeedsEncryption(const ToolContext& context,
+                     const std::string& id,
+                     const std::optional<ProxySpec>& proxy) {
+  return proxy && !proxy->password.empty() &&
+         !context.service->profiles().IsThrowaway(id);
+}
+
+// "" if a change that needs encryption (`needed`) can be stored now. Checked
+// before any write.
+std::string CheckPasswordStorage(const ToolContext& context, bool needed) {
+  ProfileProxyService* service = ProxyServiceOf(context);
+  if (needed && (!service || !service->PasswordStorageReady())) {
+    return kPasswordNotReady;
+  }
+  return std::string();
+}
+
+// Applies `change` to agent `id`. Returns false (nothing written) if the
+// service refuses it. Nothing to do, and true, if absent. Checked first with
+// CheckProxyChange and CheckPasswordStorage.
+bool ApplyProxyChange(const ToolContext& context,
+                      const std::string& id,
+                      const ProxyChange& change) {
+  if (!change.present) {
+    return true;
+  }
+  return ProxyServiceOf(context)->Set(id, change.proxy);
+}
+
+// Persistent agents (not throwaway), oldest first, then by id.
+std::vector<std::string> PersistentAgentIds(ProfileRegistry& profiles) {
+  std::vector<ProfileRegistry::Entry> entries = profiles.List();
+  std::erase_if(entries, [](const ProfileRegistry::Entry& entry) {
+    return entry.throwaway;
+  });
+  std::sort(entries.begin(), entries.end(),
+            [](const ProfileRegistry::Entry& a,
+               const ProfileRegistry::Entry& b) {
+              return a.created != b.created ? a.created < b.created
+                                            : a.id < b.id;
+            });
+  std::vector<std::string> ids;
+  for (const ProfileRegistry::Entry& entry : entries) {
+    ids.push_back(entry.id);
+  }
+  return ids;
+}
+
+// The `agentIds` argument: existing agents, no duplicates. `defaults` when
+// absent. Returns false with `error` set if invalid.
+bool GetAgentIds(const base::DictValue& args,
+                 ProfileRegistry& profiles,
+                 std::vector<std::string> defaults,
+                 std::vector<std::string>* ids,
+                 std::string* error) {
+  const base::Value* value = args.Find("agentIds");
+  if (!value) {
+    *ids = std::move(defaults);
+    return true;
+  }
+  const base::ListValue* list = value->GetIfList();
+  if (!list) {
+    *error = "agentIds must be a list of agent ids";
+    return false;
+  }
+  std::set<std::string> seen;
+  for (const base::Value& item : *list) {
+    const std::string* id = item.GetIfString();
+    if (!id || id->empty()) {
+      *error = "agentIds must be a list of agent ids";
+      return false;
+    }
+    if (!profiles.Exists(*id)) {
+      *error = "Unknown agent: " + *id + " (nothing was changed)";
+      return false;
+    }
+    if (!seen.insert(*id).second) {
+      *error = "Duplicate agent id in agentIds: " + *id;
+      return false;
+    }
+    ids->push_back(*id);
+  }
+  return true;
+}
+
 // `avatar_data`: inline uploaded avatars (chrome://agents shows them).
 base::DictValue DescribeAgent(const ToolContext& context,
                               const ProfileRegistry::Entry& entry,
@@ -162,7 +346,8 @@ base::DictValue DescribeAgent(const ToolContext& context,
           .Set("name", entry.name)
           .Set("color", ProfileRegistry::ColorName(entry.color))
           .Set("persistSessionCookies", entry.persist_session_cookies)
-          .Set("createdAt", base::TimeFormatAsIso8601(entry.created));
+          .Set("createdAt", base::TimeFormatAsIso8601(entry.created))
+          .Set("proxy", DescribeProxy(context, entry.id));
   if (entry.throwaway) {
     dict.Set("throwaway", true);
     dict.Set("idleMinutes", static_cast<int>(entry.idle_timeout.InMinutes()));
@@ -251,6 +436,12 @@ std::string CheckThrowawayIdentity(const ProfileRegistry::Identity& identity,
 void ListAgents(const ToolContext& context,
                 const base::DictValue& args,
                 ToolCallback callback) {
+  bool avatar_data = false;
+  std::string arg_error;
+  if (!GetBoolArg(args, "avatarData", &avatar_data, &arg_error)) {
+    std::move(callback).Run(ToolResult::Error(arg_error));
+    return;
+  }
   std::map<std::string, int> sessions;
   std::map<std::string, int> tabs;
   SessionManager& manager = context.service->sessions();
@@ -262,7 +453,7 @@ void ListAgents(const ToolContext& context,
   for (const ProfileRegistry::Entry& entry :
        context.service->profiles().List()) {
     list.Append(DescribeAgent(context, entry,
-                              args.FindBool("avatarData").value_or(false))
+                              avatar_data)
                     .Set("sessions", sessions[entry.id])
                     .Set("tabs", tabs[entry.id]));
   }
@@ -273,6 +464,12 @@ void ListAgents(const ToolContext& context,
 void CreateAgent(const ToolContext& context,
                  const base::DictValue& args,
                  ToolCallback callback) {
+  bool avatar_data = false;
+  std::string arg_error;
+  if (!GetBoolArg(args, "avatarData", &avatar_data, &arg_error)) {
+    std::move(callback).Run(ToolResult::Error(arg_error));
+    return;
+  }
   const base::Value* throwaway_arg = args.Find("throwaway");
   if (throwaway_arg && !throwaway_arg->is_bool()) {
     std::move(callback).Run(ToolResult::Error("throwaway must be a boolean"));
@@ -286,9 +483,12 @@ void CreateAgent(const ToolContext& context,
       return;
     }
     ProfileRegistry::Identity identity;
+    ProxyChange proxy;
     std::string error;
     if (!GetIdentity(args, &identity, &error) ||
-        !(error = CheckThrowawayIdentity(identity, true)).empty()) {
+        !(error = CheckThrowawayIdentity(identity, true)).empty() ||
+        !GetProxyChange(args, &proxy, &error) ||
+        !(error = CheckProxyChange(context, proxy)).empty()) {
       std::move(callback).Run(ToolResult::Error(error));
       return;
     }
@@ -296,6 +496,11 @@ void CreateAgent(const ToolContext& context,
         context.service->CreateThrowawayAgent(identity);
     if (!created.has_value()) {
       std::move(callback).Run(ToolResult::Error(created.error()));
+      return;
+    }
+    if (!ApplyProxyChange(context, *created, proxy)) {
+      context.service->DeleteAgent(*created, base::DoNothing());
+      std::move(callback).Run(ToolResult::Error(kPasswordNotReady));
       return;
     }
     std::move(callback).Run(ToolResult::Json(base::Value(DescribeAgent(
@@ -318,9 +523,15 @@ void CreateAgent(const ToolContext& context,
     return;
   }
   ProfileRegistry::Identity identity;
+  ProxyChange proxy;
   std::string error;
   if (!GetIdentity(args, &identity, &error) ||
-      !(error = CheckThrowawayIdentity(identity, false)).empty()) {
+      !(error = CheckThrowawayIdentity(identity, false)).empty() ||
+      !GetProxyChange(args, &proxy, &error) ||
+      !(error = CheckProxyChange(context, proxy)).empty() ||
+      !(error = CheckPasswordStorage(
+            context, NeedsEncryption(context, *id, proxy.proxy)))
+           .empty()) {
     std::move(callback).Run(ToolResult::Error(error));
     return;
   }
@@ -328,9 +539,15 @@ void CreateAgent(const ToolContext& context,
     std::move(callback).Run(ToolResult::Error("Agent already exists: " + *id));
     return;
   }
+  if (!ApplyProxyChange(context, *id, proxy)) {
+    // Not reached after the check above; undo the create anyway.
+    context.service->profiles().Delete(*id, base::DoNothing());
+    std::move(callback).Run(ToolResult::Error(kPasswordNotReady));
+    return;
+  }
   std::move(callback).Run(ToolResult::Json(
       base::Value(DescribeAgent(context, *context.service->profiles().Get(*id),
-                                args.FindBool("avatarData").value_or(false)))));
+                                avatar_data))));
 }
 
 void UpdateAgent(const ToolContext& context,
@@ -341,8 +558,13 @@ void UpdateAgent(const ToolContext& context,
     std::move(callback).Run(ToolResult::Error(MissingArgument("id")));
     return;
   }
-  ProfileRegistry::Identity identity;
+  bool avatar_data = false;
   std::string error;
+  if (!GetBoolArg(args, "avatarData", &avatar_data, &error)) {
+    std::move(callback).Run(ToolResult::Error(error));
+    return;
+  }
+  ProfileRegistry::Identity identity;
   if (!GetIdentity(args, &identity, &error)) {
     std::move(callback).Run(ToolResult::Error(error));
     return;
@@ -353,8 +575,18 @@ void UpdateAgent(const ToolContext& context,
   }
   error = CheckThrowawayIdentity(identity,
                                  context.service->profiles().IsThrowaway(*id));
-  if (!error.empty()) {
+  ProxyChange proxy;
+  if (!error.empty() || !GetProxyChange(args, &proxy, &error) ||
+      !(error = CheckProxyChange(context, proxy)).empty() ||
+      !(error = CheckPasswordStorage(
+            context, NeedsEncryption(context, *id, proxy.proxy)))
+           .empty()) {
     std::move(callback).Run(ToolResult::Error(error));
+    return;
+  }
+  // The proxy first: if the service refuses it, the identity stays unchanged.
+  if (!ApplyProxyChange(context, *id, proxy)) {
+    std::move(callback).Run(ToolResult::Error(kPasswordNotReady));
     return;
   }
   if (!context.service->profiles().Update(*id, identity)) {
@@ -364,7 +596,7 @@ void UpdateAgent(const ToolContext& context,
   context.service->sessions().RefreshGroups(*id);
   std::move(callback).Run(ToolResult::Json(
       base::Value(DescribeAgent(context, *context.service->profiles().Get(*id),
-                                args.FindBool("avatarData").value_or(false)))));
+                                avatar_data))));
 }
 
 void DeleteAgent(const ToolContext& context,
@@ -386,6 +618,192 @@ void DeleteAgent(const ToolContext& context,
                      base::DictValue().Set("id", id).Set("deleted", true))));
                },
                *id, std::move(callback)));
+}
+
+// Proxies -------------------------------------------------------------------
+
+constexpr char kProxyTestUrl[] = "https://api.ipify.org?format=json";
+
+void SetProxyAll(const ToolContext& context,
+                 const base::DictValue& args,
+                 ToolCallback callback) {
+  if (!args.Find("proxy")) {
+    std::move(callback).Run(ToolResult::Error(MissingArgument("proxy")));
+    return;
+  }
+  ProxyChange change;
+  std::vector<std::string> ids;
+  std::string error;
+  ProfileRegistry& profiles = context.service->profiles();
+  if (!GetProxyChange(args, &change, &error) ||
+      !(error = CheckProxyChange(context, change)).empty() ||
+      !GetAgentIds(args, profiles, PersistentAgentIds(profiles), &ids,
+                   &error)) {
+    std::move(callback).Run(ToolResult::Error(error));
+    return;
+  }
+  std::vector<std::pair<std::string, std::optional<ProxySpec>>> changes;
+  base::ListValue updated;
+  bool needs_encryption = false;
+  for (const std::string& id : ids) {
+    changes.emplace_back(id, change.proxy);
+    updated.Append(base::Value(id));
+    needs_encryption |= NeedsEncryption(context, id, change.proxy);
+  }
+  if (!(error = CheckPasswordStorage(context, needs_encryption)).empty()) {
+    std::move(callback).Run(ToolResult::Error(error));
+    return;
+  }
+  // All or nothing: a refusal writes nothing.
+  if (!changes.empty() &&
+      !ProxyServiceOf(context)->Set(std::move(changes))) {
+    std::move(callback).Run(ToolResult::Error(kPasswordNotReady));
+    return;
+  }
+  std::move(callback).Run(ToolResult::Json(base::Value(
+      base::DictValue().Set("updated", std::move(updated)))));
+}
+
+void AssignProxies(const ToolContext& context,
+                   const base::DictValue& args,
+                   ToolCallback callback) {
+  const base::Value* proxies = args.Find("proxies");
+  const base::ListValue* list = proxies ? proxies->GetIfList() : nullptr;
+  if (!list || list->empty()) {
+    std::move(callback).Run(ToolResult::Error(
+        "proxies must be a non-empty list of proxies"));
+    return;
+  }
+  if (!ProxyServiceOf(context)) {
+    std::move(callback).Run(ToolResult::Error(kNoProxyService));
+    return;
+  }
+  // Every proxy is checked before anything is written.
+  std::vector<ProxySpec> specs;
+  for (const base::Value& item : *list) {
+    ProxySpec spec;
+    std::string error = ParseProxyValue(item, &spec);
+    if (!error.empty()) {
+      std::move(callback).Run(ToolResult::Error(
+          "proxies[" + base::NumberToString(specs.size()) + "]: " + error));
+      return;
+    }
+    specs.push_back(std::move(spec));
+  }
+  ProfileRegistry& profiles = context.service->profiles();
+  std::vector<std::string> ids;
+  std::string error;
+  if (!GetAgentIds(args, profiles, PersistentAgentIds(profiles), &ids,
+                   &error)) {
+    std::move(callback).Run(ToolResult::Error(error));
+    return;
+  }
+  // Agent i gets proxies[i]. With reuse the list repeats; without it, agents
+  // past the end of the list keep their proxy.
+  bool reuse = false;
+  std::string arg_error;
+  if (!GetBoolArg(args, "reuse", &reuse, &arg_error)) {
+    std::move(callback).Run(ToolResult::Error(arg_error));
+    return;
+  }
+  const size_t agents = ids.size();
+  const size_t count = specs.size();
+  std::vector<std::pair<std::string, std::optional<ProxySpec>>> changes;
+  base::ListValue assigned;
+  base::ListValue unchanged;
+  base::ListValue unused;
+  bool needs_encryption = false;
+  for (size_t i = 0; i < agents; ++i) {
+    if (i >= count && !reuse) {
+      unchanged.Append(base::Value(ids[i]));
+      continue;
+    }
+    const ProxySpec& spec = specs[i % count];
+    changes.emplace_back(ids[i], spec);
+    needs_encryption |= NeedsEncryption(context, ids[i], spec);
+    assigned.Append(base::DictValue()
+                        .Set("agentId", ids[i])
+                        .Set("proxy", ProxyToRedactedValue(spec)));
+  }
+  for (size_t j = std::min(agents, count); j < count; ++j) {
+    unused.Append(ProxyToRedactedValue(specs[j]));
+  }
+  // Checked before any write; Set is all or nothing.
+  if (!(error = CheckPasswordStorage(context, needs_encryption)).empty()) {
+    std::move(callback).Run(ToolResult::Error(error));
+    return;
+  }
+  if (!changes.empty() &&
+      !ProxyServiceOf(context)->Set(std::move(changes))) {
+    std::move(callback).Run(ToolResult::Error(kPasswordNotReady));
+    return;
+  }
+  std::move(callback).Run(ToolResult::Json(base::Value(
+      base::DictValue()
+          .Set("assigned", std::move(assigned))
+          .Set("unchanged", std::move(unchanged))
+          .Set("unused", std::move(unused)))));
+}
+
+void TestProxy(const ToolContext& context,
+               const base::DictValue& args,
+               ToolCallback callback) {
+  const std::string* id = GetString(args, "agentId");
+  if (!id) {
+    std::move(callback).Run(ToolResult::Error(MissingArgument("agentId")));
+    return;
+  }
+  if (!context.service->profiles().Exists(*id)) {
+    std::move(callback).Run(ToolResult::Error("Unknown agent: " + *id));
+    return;
+  }
+  GURL url(kProxyTestUrl);
+  if (args.Find("url")) {
+    const std::string* url_string = GetString(args, "url");
+    url = url_string ? GURL(*url_string) : GURL();
+  }
+  if (std::string refusal = CheckProxyTestUrl(url); !refusal.empty()) {
+    std::move(callback).Run(ToolResult::Error(refusal));
+    return;
+  }
+  // The agent's own partition: the request goes through its proxy.
+  Profile* profile = context.service->profile();
+  content::StoragePartition* partition = profile->GetStoragePartition(
+      context.service->profiles().PartitionConfig(*id), /*can_create=*/true);
+  RunProxyCheck(
+      partition->GetNetworkContext(), profile, *id, url,
+      base::BindOnce(
+          [](std::string id, base::Value proxy, ToolCallback callback,
+             ProxyCheckResult result) {
+            base::DictValue out;
+            out.Set("agentId", id)
+                .Set("ok", result.ok)
+                .Set("latencyMs",
+                     static_cast<int>(result.latency.InMilliseconds()))
+                .Set("proxy", std::move(proxy));
+            if (result.status) {
+              out.Set("status", *result.status);
+            }
+            if (result.body) {
+              out.Set("body", *result.body);
+            }
+            if (!result.ok) {
+              std::string message =
+                  result.profile_closed
+                      ? std::string("The agent's profile was closed during "
+                                    "the test")
+                      : net::ErrorToString(result.net_error);
+              out.Set("error",
+                      base::DictValue()
+                          .Set("code",
+                               net::ErrorToShortString(result.net_error))
+                          .Set("message", message)
+                          .Set("proxyAuthFailed", result.proxy_auth_failed));
+            }
+            std::move(callback).Run(
+                ToolResult::Json(base::Value(std::move(out))));
+          },
+          *id, DescribeProxy(context, *id), std::move(callback)));
 }
 
 // Sessions ------------------------------------------------------------------
@@ -706,7 +1124,8 @@ constexpr char kCreateAgentArgs[] = R"({"type":"object","properties":{
   "name":{"type":"string","description":"Friendly name, shown on the agent's tabs (max 64 chars; default: the id)."},
   "color":{"type":"string","enum":["grey","blue","red","yellow","green","pink","purple","cyan","orange"],"description":"Color of the agent's tabs (default: picked from the id)."},
   "avatar":{"type":"string","description":"Optional image: https: or data:image/ URL (max 256 KB); empty removes it."},
-  "persistSessionCookies":{"type":"boolean","description":"Keep session cookies (no expiry) across browser restarts, like Chrome's \"Continue where you left off\" (default true). A change applies at the next browser start."}}})";
+  "persistSessionCookies":{"type":"boolean","description":"Keep session cookies (no expiry) across browser restarts, like Chrome's \"Continue where you left off\" (default true). A change applies at the next browser start."},
+  "proxy":{"oneOf":[{"type":"string","description":"\"scheme://[user[:password]@]host:port\"; scheme http, https or socks5. SOCKS takes no credentials."},{"type":"object","properties":{"scheme":{"type":"string","enum":["http","https","socks5"]},"host":{"type":"string","description":"Hostname or IP literal, no brackets."},"port":{"type":"integer","description":"1-65535."},"username":{"type":"string","description":"http/https only."},"password":{"type":"string","description":"http/https only; needs a username. Stored encrypted, never returned."},"bypass":{"type":"array","items":{"type":"string"},"description":"Hosts that go direct, e.g. \"*.internal\" or \"10.0.0.0/8\"."}},"required":["scheme","host","port"]}],"description":"The agent's own proxy: all its traffic goes through it, with no direct fallback."}}})";
 
 constexpr char kUpdateAgentArgs[] = R"({"type":"object","properties":{
   "id":{"type":"string"},
@@ -714,6 +1133,7 @@ constexpr char kUpdateAgentArgs[] = R"({"type":"object","properties":{
   "color":{"type":"string","enum":["grey","blue","red","yellow","green","pink","purple","cyan","orange"],"description":"Color of the agent's tabs (default: picked from the id)."},
   "avatar":{"type":"string","description":"Optional image: https: or data:image/ URL (max 256 KB); empty removes it."},
   "persistSessionCookies":{"type":"boolean","description":"Keep session cookies (no expiry) across browser restarts, like Chrome's \"Continue where you left off\" (default true). A change applies at the next browser start."},
+  "proxy":{"oneOf":[{"type":"string","description":"\"scheme://[user[:password]@]host:port\"; scheme http, https or socks5. SOCKS takes no credentials."},{"type":"object","properties":{"scheme":{"type":"string","enum":["http","https","socks5"]},"host":{"type":"string","description":"Hostname or IP literal, no brackets."},"port":{"type":"integer","description":"1-65535."},"username":{"type":"string","description":"http/https only."},"password":{"type":"string","description":"http/https only; needs a username. Stored encrypted, never returned."},"bypass":{"type":"array","items":{"type":"string"},"description":"Hosts that go direct, e.g. \"*.internal\" or \"10.0.0.0/8\"."}},"required":["scheme","host","port"]},{"type":"null","description":"Clears the proxy: the agent connects directly."}],"description":"The agent's own proxy (absent: unchanged). Applies live: open tabs keep working and use it at once."},
   "idleMinutes":{"type":"integer","description":"Throwaway agents only: delete after this many minutes without activity (1-1440)."}},
   "required":["id"]})";
 
@@ -756,26 +1176,61 @@ constexpr char kCaptureArgs[] = R"({"type":"object","properties":{
   "format":{"type":"string","enum":["jpeg","png"],"description":"Default jpeg."}},
   "required":["targetId"]})";
 
+constexpr char kSetProxyAllArgs[] = R"({"type":"object","properties":{
+  "proxy":{"oneOf":[{"type":"string","description":"\"scheme://[user[:password]@]host:port\"; scheme http, https or socks5. SOCKS takes no credentials."},{"type":"object","properties":{"scheme":{"type":"string","enum":["http","https","socks5"]},"host":{"type":"string","description":"Hostname or IP literal, no brackets."},"port":{"type":"integer","description":"1-65535."},"username":{"type":"string","description":"http/https only."},"password":{"type":"string","description":"http/https only; needs a username. Stored encrypted, never returned."},"bypass":{"type":"array","items":{"type":"string"},"description":"Hosts that go direct, e.g. \"*.internal\" or \"10.0.0.0/8\"."}},"required":["scheme","host","port"]},{"type":"null","description":"Clears the proxy of each agent."}],"description":"The proxy to copy into each agent (each keeps its own copy)."},
+  "agentIds":{"type":"array","items":{"type":"string"},"description":"Agent ids to set. Default: all persistent agents (not throwaway)."}},
+  "required":["proxy"]})";
+
+constexpr char kAssignProxiesArgs[] = R"({"type":"object","properties":{
+  "proxies":{"type":"array","minItems":1,"items":{"oneOf":[{"type":"string","description":"\"scheme://[user[:password]@]host:port\"; scheme http, https or socks5."},{"type":"object","properties":{"scheme":{"type":"string","enum":["http","https","socks5"]},"host":{"type":"string"},"port":{"type":"integer"},"username":{"type":"string","description":"http/https only."},"password":{"type":"string","description":"http/https only; needs a username."},"bypass":{"type":"array","items":{"type":"string"}}},"required":["scheme","host","port"]}]},"description":"Proxies, in order: proxies[i] goes to the i-th agent."},
+  "agentIds":{"type":"array","items":{"type":"string"},"description":"Agent ids, in order. Default: all persistent agents, oldest first."},
+  "reuse":{"type":"boolean","description":"Repeat the proxies when there are more agents (default false: agents past the end keep their proxy)."}},
+  "required":["proxies"]})";
+
+constexpr char kTestProxyArgs[] = R"({"type":"object","properties":{
+  "agentId":{"type":"string"},
+  "url":{"type":"string","description":"Public http or https URL to load, no localhost or private addresses, no credentials; redirects are not followed (default https://api.ipify.org?format=json)."}},
+  "required":["agentId"]})";
+
 constexpr char kListAgentsArgs[] = R"({"type":"object","properties":{
   "avatarData":{"type":"boolean","description":"Include uploaded avatar images (large; default: summarized)."}}})";
 
 constexpr Tool kTools[] = {
     {"list-agents",
      "List agents: identity (name, color, avatar), persistSessionCookies, "
-     "open sessions and tabs; throwaway agents with idleMinutes and "
-     "expiresAt.",
+     "proxy (redacted; unreadable if it can't be read), open sessions and "
+     "tabs; throwaway agents with idleMinutes and expiresAt.",
      kListAgentsArgs, &ListAgents},
     {"create-agent",
      "Create an agent: an identity shown on its tabs, and its own "
      "cookies, logins and storage, kept across restarts (session cookies "
-     "too, unless persistSessionCookies is false). throwaway: true creates "
-     "a temporary agent instead (generated id, in-memory storage, deleted "
-     "after idleMinutes without activity).",
+     "too, unless persistSessionCookies is false). proxy routes all its "
+     "traffic through a proxy. throwaway: true creates a temporary agent "
+     "instead (generated id, in-memory storage, deleted after idleMinutes "
+     "without activity).",
      kCreateAgentArgs, &CreateAgent},
     {"update-agent",
-     "Change an agent's name, color or avatar; its open tabs follow. "
+     "Change an agent's name, color, avatar or proxy (null clears the "
+     "proxy); its open tabs follow. A proxy change applies live. "
      "persistSessionCookies applies at the next browser start.",
      kUpdateAgentArgs, &UpdateAgent},
+    {"set-proxy-all",
+     "Copy one proxy (or null to clear) into several agents, each keeping "
+     "its own copy. Default: all persistent agents.",
+     kSetProxyAllArgs, &SetProxyAll},
+    {"assign-proxies",
+     "Give agents their own proxies, in order: proxies[i] goes to the i-th "
+     "agent. reuse repeats the list when there are more agents. Agents past "
+     "the end keep their proxy. Returns assigned, unchanged and unused "
+     "(redacted) proxies.",
+     kAssignProxiesArgs, &AssignProxies},
+    {"test-proxy",
+     "Check an agent's proxy: sends a request to a URL (default "
+     "https://api.ipify.org?format=json) through the agent's proxy. Only "
+     "public http or https targets are allowed (no localhost or private "
+     "addresses, no credentials in the URL); redirects are not followed. "
+     "Returns ok, latencyMs, status, a body excerpt and error details.",
+     kTestProxyArgs, &TestProxy},
     {"delete-agent",
      "Close the agent's sessions and tabs and wipe its storage.",
      kAgentIdArgs, &DeleteAgent},

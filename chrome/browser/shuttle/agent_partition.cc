@@ -4,6 +4,8 @@
 
 #include "chrome/browser/shuttle/agent_partition.h"
 
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "base/files/file_path.h"
@@ -58,25 +60,53 @@ bool ShouldPersistSessionCookies(
          dict->FindBool(prefs::kPersistSessionCookies).value_or(true);
 }
 
-bool IsAgentWebContents(content::WebContents* contents) {
+namespace {
+
+// The partition domain of the agent partition `contents` shows, or nullopt if
+// IsAgentWebContents is false. The frame and its partition are looked up once.
+std::optional<std::string> AgentPartitionDomain(
+    content::WebContents* contents) {
   if (!contents) {
-    return false;
+    return std::nullopt;
   }
-  const content::StoragePartitionConfig& config =
-      contents->GetPrimaryMainFrame()->GetStoragePartition()->GetConfig();
+  content::RenderFrameHost* frame = contents->GetPrimaryMainFrame();
+  content::StoragePartition* partition =
+      frame ? frame->GetStoragePartition() : nullptr;
+  if (!partition) {
+    return std::nullopt;
+  }
+  // A copy: GetConfig() may return a temporary.
+  const content::StoragePartitionConfig config = partition->GetConfig();
   if (config.is_default() || !config.partition_name().empty() ||
       !base::StartsWith(config.partition_domain(),
                         kAgentPartitionDomainPrefix)) {
-    return false;
+    return std::nullopt;
   }
   // Only throwaway agents ("shuttle-tmp-<id>",
   // ProfileRegistry::kThrowawayPrefix) have in-memory storage. On-disk
   // "shuttle-tmp-" partitions are persistent agents created before the prefix
   // was reserved.
-  return !config.in_memory() ||
-         base::StartsWith(config.partition_domain(),
-                          std::string(kAgentPartitionDomainPrefix) +
-                              kThrowawayAgentIdPrefix);
+  if (config.in_memory() &&
+      !base::StartsWith(config.partition_domain(),
+                        std::string(kAgentPartitionDomainPrefix) +
+                            kThrowawayAgentIdPrefix)) {
+    return std::nullopt;
+  }
+  return config.partition_domain();
+}
+
+}  // namespace
+
+bool IsAgentWebContents(content::WebContents* contents) {
+  return AgentPartitionDomain(contents).has_value();
+}
+
+std::string AgentIdForWebContents(content::WebContents* contents) {
+  std::optional<std::string> domain = AgentPartitionDomain(contents);
+  if (!domain) {
+    return std::string();
+  }
+  return domain->substr(sizeof(kAgentPartitionDomainPrefix) - 1);
 }
 
 }  // namespace shuttle

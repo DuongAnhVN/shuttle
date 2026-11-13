@@ -26,6 +26,7 @@
 #include "chrome/browser/font_pref_change_notifier_factory.h"
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/renderer_preferences_util.h"
+#include "chrome/browser/shuttle/proxy_auth.h"
 #include "chrome/browser/ui/prefs/pref_watcher.h"
 #include "chrome/common/chrome_features.h"
 #include "chrome/common/pref_font_webkit_names.h"
@@ -367,6 +368,7 @@ PrefsTabHelper::PrefsTabHelper(WebContents* contents)
   blink::RendererPreferences* render_prefs =
       GetWebContents().GetMutableRendererPrefs();
   renderer_preferences_util::UpdateFromSystemSettings(render_prefs, profile_);
+  shuttle::ApplyAgentRendererPrefs(profile_, &GetWebContents(), render_prefs);
 
 #if BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_MAC) && !BUILDFLAG(IS_ANDROID)
   ThemeServiceFactory::GetForProfile(profile_)->AddObserver(this);
@@ -507,6 +509,7 @@ void PrefsTabHelper::UpdateRendererPreferences() {
   blink::RendererPreferences* prefs =
       GetWebContents().GetMutableRendererPrefs();
   renderer_preferences_util::UpdateFromSystemSettings(prefs, profile_);
+  shuttle::ApplyAgentRendererPrefs(profile_, &GetWebContents(), prefs);
   GetWebContents().SyncRendererPrefs();
 }
 

@@ -58,6 +58,43 @@ source_set("agent_partition") {
   ]
 }
 
+# Per-agent proxy: ProxySpec, its storage (encrypted password), the service that
+# applies it to the agent's NetworkContext, and the proxy login. Called by the
+# network stack and the content browser client: no dependency on
+# ShuttleService / ProfileRegistry (:impl). Design:
+# tools/shuttle/docs/FEATURES.md, "Per-agent proxy".
+source_set("agent_proxy") {
+  sources = [
+    "agent_proxy.cc",
+    "agent_proxy.h",
+    "profile_proxy_service.cc",
+    "profile_proxy_service.h",
+    "profile_proxy_service_factory.cc",
+    "profile_proxy_service_factory.h",
+    "proxy_auth.cc",
+    "proxy_auth.h",
+  ]
+  public_deps = [
+    "//base",
+    "//net",
+  ]
+  deps = [
+    ":agent_partition",
+    "//chrome/browser/profiles:profile",
+    "//chrome/common:constants",
+    "//components/keyed_service/content",
+    "//components/os_crypt/async/browser",
+    "//components/os_crypt/async/common",
+    "//components/prefs",
+    "//content/public/browser",
+    "//mojo/public/cpp/bindings",
+    "//services/network/public/cpp",
+    "//services/network/public/mojom",
+    "//third_party/blink/public/common",
+    "//url",
+  ]
+}
+
 source_set("impl") {
   sources = [
     "agent_browser_sidecar.cc",
@@ -74,6 +111,10 @@ source_set("impl") {
     "page_tools_data.inc",
     "profile_registry.cc",
     "profile_registry.h",
+    "proxy_check.cc",
+    "proxy_check.h",
+    "proxy_tab_sync.cc",
+    "proxy_tab_sync.h",
     "session_cdp_filter.cc",
     "session_cdp_filter.h",
     "session_manager.cc",
@@ -84,6 +125,7 @@ source_set("impl") {
 
   deps = [
     ":agent_partition",
+    ":agent_proxy",
     ":shuttle",
     ":switches",
     "//base",
@@ -110,6 +152,7 @@ source_set("impl") {
     "//components/viz/common",
     "//content/public/browser",
     "//crypto",
+    "//mojo/public/cpp/bindings",
     "//net",
     "//services/data_decoder/public/cpp",
     "//services/network/public/cpp",

@@ -1041,6 +1041,7 @@ source_set("core") {
     "//chrome/browser/serial",
     "//chrome/browser/service_worker",
     "//chrome/browser/sessions",
+    "//chrome/browser/shuttle:agent_proxy",
     "//chrome/browser/site_isolation",
     "//chrome/browser/site_protection",
     "//chrome/browser/site_protection:utils",

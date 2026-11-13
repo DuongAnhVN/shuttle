@@ -45,6 +45,10 @@ bool ShouldPersistSessionCookies(Profile* profile,
 // check that the agent exists.
 bool IsAgentWebContents(content::WebContents* contents);
 
+// The agent id of the tab `contents` shows ("tmp-<id>" for a throwaway agent,
+// as in AgentIdForPartitionPath), or "" if IsAgentWebContents is false.
+std::string AgentIdForWebContents(content::WebContents* contents);
+
 }  // namespace shuttle
 
 #endif  // CHROME_BROWSER_SHUTTLE_AGENT_PARTITION_H_

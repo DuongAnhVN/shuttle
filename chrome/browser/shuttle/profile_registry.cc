@@ -32,6 +32,7 @@
 #include "base/values.h"
 #include "chrome/browser/shuttle/agent_partition.h"
 #include "chrome/browser/shuttle/pref_names.h"
+#include "chrome/browser/shuttle/profile_proxy_service_factory.h"
 #include "chrome/browser/profiles/profile.h"
 #include "components/pref_registry/pref_registry_syncable.h"
 #include "components/prefs/pref_service.h"
@@ -546,6 +547,10 @@ content::StoragePartitionConfig ProfileRegistry::PartitionConfig(
 }
 
 void ProfileRegistry::Delete(const std::string& id, base::OnceClosure done) {
+  // Also reached for throwaway expiry (DeleteThrowaway runs from here only).
+  if (auto* proxy = ProfileProxyServiceFactory::GetForProfile(profile_)) {
+    proxy->Forget(id);
+  }
   if (throwaway_.contains(id)) {
     DeleteThrowaway(id, std::move(done));
     return;

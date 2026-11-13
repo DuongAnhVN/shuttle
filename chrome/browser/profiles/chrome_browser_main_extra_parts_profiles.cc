@@ -13,6 +13,7 @@
 #include "build/chromeos_buildflags.h"
 #include "chrome/browser/accessibility/accessibility_labels_service_factory.h"
 #include "chrome/browser/controlled_frame/controlled_frame_media_permission_cache_factory.h"
+#include "chrome/browser/shuttle/profile_proxy_service_factory.h"
 #include "chrome/browser/shuttle/shuttle_service_factory.h"
 #include "chrome/browser/accessibility/page_colors_controller_factory.h"
 #include "chrome/browser/autocomplete/autocomplete_classifier_factory.h"
@@ -413,6 +414,7 @@ void ChromeBrowserMainExtraPartsProfiles::
   // into consideration buildflags, repeating buildflags is ok):
   AcceptLanguagesServiceFactory::GetInstance();
   shuttle::ShuttleServiceFactory::GetInstance();
+  shuttle::ProfileProxyServiceFactory::GetInstance();
   AccessibilityLabelsServiceFactory::GetInstance();
 #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_MAC) || BUILDFLAG(IS_WIN)
   search_integrity::SearchIntegrityFactory::GetInstance();
@@ -829,4 +831,6 @@ void ChromeBrowserMainExtraPartsProfiles::
 
 void ChromeBrowserMainExtraPartsProfiles::PreProfileInit() {
   EnsureBrowserContextKeyedServiceFactoriesBuilt();
+  shuttle::ProfileProxyServiceFactory::GetInstance()->set_os_crypt_async(
+      g_browser_process->os_crypt_async());
 }

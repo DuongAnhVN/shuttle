@@ -42,6 +42,8 @@
 #include "chrome/browser/net/system_network_context_manager.h"
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/shuttle/agent_partition.h"
+#include "chrome/browser/shuttle/profile_proxy_service.h"
+#include "chrome/browser/shuttle/profile_proxy_service_factory.h"
 #include "chrome/browser/signin/signin_util.h"
 #include "chrome/browser/ssl/sct_reporting_service.h"
 #include "chrome/browser/ssl/sct_reporting_service_factory.h"
@@ -1335,6 +1337,13 @@ void ProfileNetworkContextService::ConfigureNetworkContextParamsInternal(
   }
 
   proxy_config_monitor_->AddToNetworkContextParams(network_context_params);
+  // Agent partitions take their proxy from their agent (see
+  // ProfileProxyService); every other partition keeps the system proxy.
+  if (shuttle::ProfileProxyService* proxies =
+          shuttle::ProfileProxyServiceFactory::GetForProfile(profile_)) {
+    proxies->ConfigureNetworkContextParams(relative_partition_path,
+                                           network_context_params);
+  }
 
   network_context_params->enable_certificate_reporting = true;
 

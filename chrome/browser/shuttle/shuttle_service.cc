@@ -26,6 +26,7 @@
 #include "chrome/browser/shuttle/mcp_tools.h"
 #include "chrome/browser/shuttle/page_tools.h"
 #include "chrome/browser/shuttle/profile_registry.h"
+#include "chrome/browser/shuttle/proxy_tab_sync.h"
 #include "chrome/browser/shuttle/session_cdp_filter.h"
 #include "chrome/browser/shuttle/session_manager.h"
 #include "chrome/browser/shuttle/switches.h"
@@ -174,8 +175,10 @@ std::optional<base::TimeDelta> ThrowawayIdleTimeoutOverride() {
 }  // namespace
 
 ShuttleService::ShuttleService(Profile* profile)
-    : profiles_(std::make_unique<ProfileRegistry>(profile)),
+    : profile_(profile),
+      profiles_(std::make_unique<ProfileRegistry>(profile)),
       sessions_(std::make_unique<SessionManager>(profile, profiles_.get())),
+      proxy_tab_sync_(std::make_unique<ProxyTabSync>(profile)),
       avatars_(std::make_unique<AvatarCache>(
           profile,
           profiles_.get(),

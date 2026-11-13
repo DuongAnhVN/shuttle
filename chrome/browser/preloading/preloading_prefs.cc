@@ -13,9 +13,13 @@
 namespace prefetch {
 void RegisterPredictionOptionsProfilePrefs(
     user_prefs::PrefRegistrySyncable* registry) {
+  // Shuttle: speculative loading off by default, see FEATURES.md Per-agent
+  // proxy. Gates prefetch, prerender and preconnect (LoadingPredictor,
+  // anchor preconnect, navigation preconnect); a stored user or policy value
+  // still wins.
   registry->RegisterIntegerPref(
       prefs::kNetworkPredictionOptions,
-      static_cast<int>(NetworkPredictionOptions::kDefault),
+      static_cast<int>(NetworkPredictionOptions::kDisabled),
       user_prefs::PrefRegistrySyncable::SYNCABLE_PREF);
 }
 

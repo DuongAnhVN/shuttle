@@ -5,6 +5,7 @@
 #include "chrome/browser/shuttle/shuttle_service_factory.h"
 
 #include "chrome/browser/shuttle/shuttle_service.h"
+#include "chrome/browser/shuttle/profile_proxy_service_factory.h"
 #include "chrome/browser/shuttle/profile_registry.h"
 #include "chrome/browser/profiles/profile.h"
 
@@ -29,7 +30,11 @@ ShuttleServiceFactory::ShuttleServiceFactory()
           // Shuttle runs one regular profile; nothing else gets agents.
           ProfileSelections::Builder()
               .WithRegular(ProfileSelection::kOriginalOnly)
-              .Build()) {}
+              .Build()) {
+  // ShuttleService's ProxyTabSync observes the proxy service: the proxy
+  // service must be destroyed after the ShuttleService.
+  DependsOn(ProfileProxyServiceFactory::GetInstance());
+}
 
 ShuttleServiceFactory::~ShuttleServiceFactory() = default;
 

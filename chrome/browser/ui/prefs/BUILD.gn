@@ -41,6 +41,7 @@ source_set("impl") {
     "//chrome/browser:font_pref",
     "//chrome/browser:renderer_preferences_util",
     "//chrome/browser/profiles:profile",
+    "//chrome/browser/shuttle:agent_proxy",
     "//chrome/browser/themes",
     "//chrome/browser/ui/zoom",
     "//chrome/common",

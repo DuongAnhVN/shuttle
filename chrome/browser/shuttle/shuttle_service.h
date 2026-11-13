@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "base/functional/callback_forward.h"
+#include "base/memory/raw_ptr.h"
 #include "base/memory/weak_ptr.h"
 #include "base/time/time.h"
 #include "base/timer/timer.h"
@@ -36,6 +37,7 @@ namespace shuttle {
 class AvatarCache;
 class PageToolManager;
 class ProfileRegistry;
+class ProxyTabSync;
 class SessionManager;
 
 // The in-browser MCP server: agent profiles, sessions and tabs. Reached
@@ -98,6 +100,8 @@ class ShuttleService : public KeyedService {
   // a busy agent is kept), or nullopt for other agents.
   std::optional<base::Time> ThrowawayExpiry(const std::string& agent_id) const;
 
+  // The Chrome profile this service belongs to (outlives the service).
+  Profile* profile() const { return profile_; }
   ProfileRegistry& profiles() { return *profiles_; }
   SessionManager& sessions() { return *sessions_; }
 
@@ -115,8 +119,12 @@ class ShuttleService : public KeyedService {
   base::TimeDelta IdleTimeoutOf(const ProfileRegistry::Entry& entry) const;
   base::TimeTicks LastActivityOf(const std::string& agent_id) const;
 
+  raw_ptr<Profile> profile_;
   std::unique_ptr<ProfileRegistry> profiles_;
   std::unique_ptr<SessionManager> sessions_;
+  // After sessions_: destroyed first, so no proxy change reaches a dead
+  // session manager's tabs.
+  std::unique_ptr<ProxyTabSync> proxy_tab_sync_;
   std::unique_ptr<AvatarCache> avatars_;
   // After sessions_: sidecars die before the sessions they serve.
   std::unique_ptr<PageToolManager> page_tools_;
