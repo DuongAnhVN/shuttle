@@ -12,7 +12,11 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { args, cdp, check, cleanup, finish, rpc, skipCheck, sleep } from './lib/smoke.mjs';
+import { args, cdp, check as checkNamed, cleanup, finish, rpc, skipCheck, sleep } from './lib/smoke.mjs';
+
+// lib's check is (name, ok, detail). This probe was written with both orders; a call whose first argument is not a
+// string is (ok, name, detail). Without this, an (ok, name, ...) call passes whatever `ok` is (the name is truthy).
+const check = (a, b, c) => (typeof a === 'string' ? checkNamed(a, b, c) : checkNamed(b, a, c));
 
 const udd = args[0];
 const SOCKS_MSG = 'SOCKS proxy with authentication is not supported';
@@ -166,11 +170,15 @@ async function tabOf(agent) {
 }
 // Navigates the agent's tab to a fresh origin URL (unique tag: no cache hit) and returns the origin's record of it.
 let tagN = 0;
-async function visit(agent, pathname = '/p') {
+// navigate-tab can return while a navigation through a proxy is still in flight, so wait (up to waitMs) until the origin
+// has recorded the request. A case that is expected to FAIL (wrong password, backoff) passes a short waitMs.
+async function visit(agent, pathname = '/p', waitMs = 10000, base = ORIGIN) {
   const t = await tabOf(agent);
   const tag = `t${++tagN}`;
-  const nav = await call('navigate-tab', { targetId: t.targetId, url: `${ORIGIN}${pathname}?tag=${tag}` });
-  return { nav, hit: hits.find((h) => h.tag === tag) };
+  const t0 = Date.now();
+  const nav = await call('navigate-tab', { targetId: t.targetId, url: `${base}${pathname}?tag=${tag}` });
+  await waitUntil(() => hits.some((h) => h.tag === tag), waitMs);
+  return { nav, hit: hits.find((h) => h.tag === tag), ms: Date.now() - t0 };
 }
 async function evalIn(cdpUrl, expression, ms = 30000) {
   const c = await cdp(cdpUrl);
@@ -213,7 +221,8 @@ d = diff(before, snap());
 check(!!rb.hit && rb.hit.host === `origin.test:${originPort}` && d.s >= 1 && d.a === 0 && d.b === 0 && d.auth === 0,
   'agent B goes through its SOCKS5 proxy only', JSON.stringify({ hit: rb.hit, d }));
 before = snap();
-const rc = await visit(C);
+// origin.test only resolves through a proxy, so the proxy-less agent visits the origin by its loopback address.
+const rc = await visit(C, '/p', 10000, `http://127.0.0.1:${originPort}`);
 d = diff(before, snap());
 check(!!rc.hit && rc.hit.host === `127.0.0.1:${originPort}` && Object.values(d).every((x) => x === 0),
   'agent C without proxy goes direct (no proxy saw it)', JSON.stringify({ hit: rc.hit, d }));
@@ -344,14 +353,14 @@ check('wrong password error does not echo the password', !JSON.stringify(te).inc
 // Backoff: the rejection starts a 60 s window with no credentials sent. A navigation inside it reaches the proxy
 // without Proxy-Authorization and is challenged; test-proxy would reset the window, so this uses navigation.
 const mark = PX.auth.log.length;
-const rBackoff = await visit(E);
+const rBackoff = await visit(E, '/p', 3000);
 const inBackoff = PX.auth.log.slice(mark);
 check('within the 60 s backoff no credentials are sent', inBackoff.length >= 1 && inBackoff.every((e) => e.status === 407 && !e.creds) && !rBackoff.hit,
-  JSON.stringify(inBackoff.slice(0, 3)));
+  JSON.stringify({ nav: rBackoff.nav, hit: !!rBackoff.hit, log: inBackoff.slice(0, 4) }).slice(0, 300));
 // Changing the agent's proxy clears the backoff: the same agent's next navigation carries the credentials again.
 await call('update-agent', { id: E, proxy: pxUrl('auth', PW) });
 const rFix = await visit(E);
-check('changing the proxy clears the backoff', !!rFix.hit, JSON.stringify(rFix.nav).slice(0, 120));
+check('changing the proxy clears the backoff', !!rFix.hit, JSON.stringify({ nav: rFix.nav, ms: rFix.ms }).slice(0, 160));
 
 // WebSocket (CONNECT tunnel) through the auth proxy, agent D (correct password).
 await visit(D, '/p');
