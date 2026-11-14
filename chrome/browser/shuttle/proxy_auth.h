@@ -15,7 +15,7 @@
 class Profile;
 
 namespace blink {
-class RendererPreferences;
+struct RendererPreferences;
 }
 
 namespace content {

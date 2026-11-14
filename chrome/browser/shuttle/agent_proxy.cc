@@ -199,7 +199,8 @@ base::ListValue BypassList(const std::vector<std::string>& bypass) {
 // Parses the object form (also the decrypted stored form, which has no
 // "password_enc" key). Returns "" or an error that never contains a value.
 std::string ParseProxyDict(const base::DictValue& dict, ProxySpec* out) {
-  for (const auto& [key, value] : dict) {
+  // By value: iterating a DictValue yields temporary (key, value) pairs.
+  for (const auto [key, value] : dict) {
     if (key != kKeyScheme && key != kKeyHost && key != kKeyPort &&
         key != kKeyUsername && key != kKeyPassword && key != kKeyBypass) {
       return "Unknown proxy field: " + key.substr(0, 64);

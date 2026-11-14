@@ -32,6 +32,7 @@
 #include "base/values.h"
 #include "chrome/browser/shuttle/agent_partition.h"
 #include "chrome/browser/shuttle/pref_names.h"
+#include "chrome/browser/shuttle/profile_proxy_service.h"
 #include "chrome/browser/shuttle/profile_proxy_service_factory.h"
 #include "chrome/browser/profiles/profile.h"
 #include "components/pref_registry/pref_registry_syncable.h"

@@ -775,12 +775,15 @@ void TestProxy(const ToolContext& context,
       base::BindOnce(
           [](std::string id, base::Value proxy, ToolCallback callback,
              ProxyCheckResult result) {
-            base::DictValue out;
-            out.Set("agentId", id)
-                .Set("ok", result.ok)
-                .Set("latencyMs",
-                     static_cast<int>(result.latency.InMilliseconds()))
-                .Set("proxy", std::move(proxy));
+            // Set() chains only on an rvalue (on an lvalue it returns the
+            // inserted Value*), so build the first fields from a temporary.
+            base::DictValue out =
+                base::DictValue()
+                    .Set("agentId", id)
+                    .Set("ok", result.ok)
+                    .Set("latencyMs",
+                         static_cast<int>(result.latency.InMilliseconds()))
+                    .Set("proxy", std::move(proxy));
             if (result.status) {
               out.Set("status", *result.status);
             }
