@@ -53,7 +53,7 @@ String LocaleController::SetLocaleOverride(const String& locale,
   if (locale_override_ == locale)
     return String();
   if (locale.empty()) {
-    UpdateLocale(embedder_locale_);
+    UpdateLocale(BaseLocale());
   } else {
     std::optional<base::i18n::LanguageTag> language_tag =
         base::i18n::GetLanguageTagFromString(locale.Ascii());
@@ -64,6 +64,37 @@ String LocaleController::SetLocaleOverride(const String& locale,
   }
   locale_override_ = locale;
   return String();
+}
+
+String LocaleController::SetPersonaLocale(const String& locale) {
+  base::AutoLock locker(lock_);
+
+  if (persona_locale_.empty() && locale.empty()) {
+    return String();
+  }
+  if (!locale.empty() && persona_locale_ == locale) {
+    return String();
+  }
+  std::optional<base::i18n::LanguageTag> tag;
+  if (!locale.empty()) {
+    tag = base::i18n::GetLanguageTagFromString(locale.Ascii());
+    if (!tag) {
+      return "Invalid locale name";
+    }
+  }
+  persona_locale_ = locale;
+  persona_locale_tag_ = std::move(tag);
+  // While a DevTools override is active it stays in effect; resetting it
+  // falls back to the new base locale.
+  if (locale_override_.empty()) {
+    UpdateLocale(BaseLocale());
+  }
+  return String();
+}
+
+const base::i18n::LanguageTag& LocaleController::BaseLocale() const {
+  lock_.AssertAcquired();
+  return persona_locale_tag_ ? *persona_locale_tag_ : embedder_locale_;
 }
 
 void LocaleController::UpdateLocale(const base::i18n::LanguageTag& locale) {

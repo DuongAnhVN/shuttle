@@ -42,14 +42,19 @@ source_set("network_access") {
   ]
 }
 
+# Names of the Shuttle prefs (header only), shared by the targets below.
+source_set("pref_names") {
+  sources = [ "pref_names.h" ]
+}
+
 # Agent partition helpers the network stack calls (session-cookie
 # persistence); no dependency on the service.
 source_set("agent_partition") {
   sources = [
     "agent_partition.cc",
     "agent_partition.h",
-    "pref_names.h",
   ]
+  public_deps = [ ":pref_names" ]
   deps = [
     "//base",
     "//chrome/browser/profiles:profile",
@@ -58,10 +63,10 @@ source_set("agent_partition") {
   ]
 }
 
-# Per-agent proxy: ProxySpec, its storage (encrypted password), the service that
-# applies it to the agent's NetworkContext, and the proxy login. Called by the
-# network stack and the content browser client: no dependency on
-# ShuttleService / ProfileRegistry (:impl). Design:
+# Per-agent proxy: ProxySpec, its storage (encrypted password) and the service
+# that applies it to the agent's NetworkContext. Called by the network stack:
+# no dependency on ShuttleService / ProfileRegistry (:impl), on the tab and
+# login code (:agent_proxy_auth) nor on the fingerprint persona. Design:
 # tools/shuttle/docs/FEATURES.md, "Per-agent proxy".
 source_set("agent_proxy") {
   sources = [
@@ -71,8 +76,6 @@ source_set("agent_proxy") {
     "profile_proxy_service.h",
     "profile_proxy_service_factory.cc",
     "profile_proxy_service_factory.h",
-    "proxy_auth.cc",
-    "proxy_auth.h",
   ]
   public_deps = [
     "//base",
@@ -80,6 +83,7 @@ source_set("agent_proxy") {
   ]
   deps = [
     ":agent_partition",
+    ":pref_names",
     "//chrome/browser/profiles:profile",
     "//chrome/common:constants",
     "//components/keyed_service/content",
@@ -92,6 +96,117 @@ source_set("agent_proxy") {
     "//services/network/public/mojom",
     "//third_party/blink/public/common",
     "//url",
+  ]
+}
+
+# Fingerprint persona: the versioned schema of the device a Chromium profile
+# presents (os, browser, user agent, client hints, locale, timezone, hardware,
+# screen), its pref and MCP forms, and its coherence checks. Pure data, no
+# dependency on the service. Schema and persistence only. Design:
+# tools/shuttle/docs/FINGERPRINT.md.
+source_set("fingerprint_persona") {
+  sources = [
+    "fingerprint_persona.cc",
+    "fingerprint_persona.h",
+  ]
+  public_deps = [ "//base" ]
+}
+
+# The profile's fingerprint persona service (one persona per Chromium profile,
+# shared by all tabs, agents and partitions): where the runtime reads it from
+# (ProfilePersonaService, the profile pref), its mapping to renderer
+# preferences (persona_runtime) and to the profile's NetworkContexts
+# (Accept-Language, user agent). This is all the network stack needs: no
+# WebContents, navigation or tab code (:persona_tab_prefs), no dependency on
+# ShuttleService / ProfileRegistry (:impl, which writes through the service),
+# on :agent_proxy or on :agent_partition.
+source_set("agent_persona") {
+  sources = [
+    "persona_runtime.cc",
+    "persona_runtime.h",
+    "profile_persona_service.cc",
+    "profile_persona_service.h",
+    "profile_persona_service_factory.cc",
+    "profile_persona_service_factory.h",
+  ]
+  public_deps = [
+    ":fingerprint_persona",
+    "//base",
+    "//components/keyed_service/core",
+    "//third_party/blink/public/common",
+  ]
+  deps = [
+    ":pref_names",
+    "//chrome/browser/profiles:profile",
+    "//components/embedder_support:user_agent",
+    "//components/keyed_service/content",
+    "//components/pref_registry",
+    "//components/prefs",
+    "//net",
+    "//services/network/public/mojom",
+    "//third_party/icu",
+  ]
+}
+
+# Applies the profile persona to WebContents (renderer preferences, user agent
+# override, per-navigation override flag) and to worker preferences. Called by
+# the tab prefs and the content browser client; depends on the content browser
+# API, which is why it is not part of :agent_persona.
+source_set("persona_tab_prefs") {
+  sources = [
+    "persona_tab_prefs.cc",
+    "persona_tab_prefs.h",
+  ]
+  deps = [
+    ":agent_persona",
+    ":fingerprint_persona",
+    "//base",
+    "//chrome/browser/profiles:profile",
+    "//content/public/browser",
+    "//third_party/blink/public/common",
+    "//url",
+  ]
+}
+
+# Native WebRTC IP handling: disable_non_proxied_udp for a proxied agent or a
+# profile with an explicit proxy of its own (Chromium's WebRtcIpHandlingPolicy
+# only, no spoofing). Pure pref logic, no content dependency.
+source_set("webrtc_policy") {
+  sources = [
+    "webrtc_policy.cc",
+    "webrtc_policy.h",
+  ]
+  deps = [
+    "//base",
+    "//components/prefs",
+    "//components/proxy_config",
+    "//third_party/blink/public/common",
+    "//third_party/blink/public/mojom:mojom_platform_headers",
+  ]
+}
+
+# Proxy login and the per-tab renderer preferences of agent tabs
+# (ApplyAgentRendererPrefs: WebRTC policy of proxied agents, then the profile
+# persona). Called by the content browser client, the tab prefs and :impl.
+source_set("agent_proxy_auth") {
+  sources = [
+    "proxy_auth.cc",
+    "proxy_auth.h",
+  ]
+  public_deps = [
+    "//content/public/browser",
+    "//net",
+  ]
+  deps = [
+    ":agent_partition",
+    ":agent_proxy",
+    ":persona_tab_prefs",
+    ":webrtc_policy",
+    "//base",
+    "//chrome/browser/profiles:profile",
+    "//chrome/common:constants",
+    "//components/prefs",
+    "//third_party/blink/public/common",
   ]
 }
 
@@ -125,12 +240,17 @@ source_set("impl") {
 
   deps = [
     ":agent_partition",
+    ":agent_persona",
     ":agent_proxy",
+    ":agent_proxy_auth",
+    ":fingerprint_persona",
+    ":pref_names",
     ":shuttle",
     ":switches",
     "//base",
     "//base:i18n",
     "//chrome/browser:browser_features",
+    "//chrome/browser:renderer_preferences_util",
     "//chrome/browser:shell_integration",
     "//chrome/browser/headless",
     "//chrome/browser/lifetime",
@@ -138,6 +258,7 @@ source_set("impl") {
     "//chrome/browser/profiles/keep_alive",
     "//chrome/browser/ui/browser_window",
     "//chrome/browser/ui/navigator",
+    "//chrome/browser/ui/prefs",
     "//chrome/browser/ui/tabs:tab_enums",
     "//chrome/browser/ui/tabs:tab_group",
     "//chrome/browser/ui/tabs:tab_strip",
@@ -146,6 +267,7 @@ source_set("impl") {
     "//components/keyed_service/content",
     "//components/pref_registry",
     "//components/prefs",
+    "//components/proxy_config",
     "//components/tab_groups",
     "//components/tabs:public",
     "//components/version_info",
@@ -158,6 +280,7 @@ source_set("impl") {
     "//services/network/public/cpp",
     "//services/network/public/mojom",
     "//skia",
+    "//third_party/blink/public/common",
     "//third_party/re2",
     "//ui/base",
     "//ui/base/clipboard",

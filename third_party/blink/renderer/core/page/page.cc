@@ -64,6 +64,7 @@
 #include "third_party/blink/renderer/core/inspector/console_message.h"
 #include "third_party/blink/renderer/core/inspector/console_message_storage.h"
 #include "third_party/blink/renderer/core/inspector/inspector_issue_storage.h"
+#include "third_party/blink/renderer/core/inspector/locale_controller.h"
 #include "third_party/blink/renderer/core/layout/layout_object_inlines.h"
 #include "third_party/blink/renderer/core/layout/layout_view.h"
 #include "third_party/blink/renderer/core/loader/idleness_detector.h"
@@ -92,6 +93,7 @@
 #include "third_party/blink/renderer/core/scroll/scrollbar_theme_overlay_mobile.h"
 #include "third_party/blink/renderer/core/svg/graphics/svg_image_chrome_client.h"
 #include "third_party/blink/renderer/core/svg/svg_document_resource_tracker.h"
+#include "third_party/blink/renderer/core/timezone/timezone_controller.h"
 #include "third_party/blink/renderer/core/svg/svg_resource_scheduler_registry.h"
 #include "third_party/blink/renderer/platform/bindings/source_location.h"
 #include "third_party/blink/renderer/platform/graphics/paint/drawing_recorder.h"
@@ -753,6 +755,53 @@ void Page::SetDefaultPageScaleLimits(float min_scale, float max_scale) {
   root_view->SetNeedsLayout();
 }
 
+void Page::SetRendererPreferences(const RendererPreferences& prefs) {
+  const bool persona_intl_changed =
+      renderer_preferences_.timezone_override != prefs.timezone_override ||
+      renderer_preferences_.locale_override != prefs.locale_override;
+  renderer_preferences_ = prefs;
+  if (persona_intl_changed) {
+    ApplyPersonaIntlOverrides(/*page_is_going_away=*/false);
+  }
+}
+
+void Page::ApplyPersonaIntlOverrides(bool page_is_going_away) {
+  // Shuttle: the persona time zone and locale become the renderer process' ICU
+  // defaults. That is PROCESS-global (no per-page isolation here); the
+  // embedder only sends these fields to processes that serve one profile (see
+  // renderer_preferences.mojom). A page without a value does not undo
+  // the one a sibling page of the process still carries (a persona change
+  // reaches the pages one after the other); the last page to lose it clears it.
+  // A page that is being destroyed (already erased from OrdinaryPages()) no
+  // longer contributes its own values, so destroying the last page that
+  // carried a persona value restores the embedder/host default instead of
+  // leaving it in the process-global ICU state. Only pages of this renderer
+  // process are consulted, so another profile's persona (a different process)
+  // is never touched, and a sibling page that still carries a value keeps it.
+  String timezone;
+  String locale;
+  if (!page_is_going_away) {
+    timezone = String::FromUtf8(renderer_preferences_.timezone_override);
+    locale = String::FromUtf8(renderer_preferences_.locale_override);
+  }
+  if (timezone.empty() || locale.empty()) {
+    for (const Page* other : OrdinaryPages()) {
+      if (other == this) {
+        continue;
+      }
+      const RendererPreferences& other_prefs = other->GetRendererPreferences();
+      if (timezone.empty() && !other_prefs.timezone_override.empty()) {
+        timezone = String::FromUtf8(other_prefs.timezone_override);
+      }
+      if (locale.empty() && !other_prefs.locale_override.empty()) {
+        locale = String::FromUtf8(other_prefs.locale_override);
+      }
+    }
+  }
+  TimeZoneController::SetPersonaTimeZone(timezone);
+  LocaleController::instance().SetPersonaLocale(locale);
+}
+
 void Page::SetUserAgentPageScaleConstraints(
     const PageScaleConstraints& new_constraints) {
   if (new_constraints == GetPageScaleConstraintsSet().UserAgentConstraints())
@@ -1383,6 +1432,13 @@ void Page::WillBeDestroyed() {
   DCHECK(AllPages().Contains(this));
   AllPages().erase(this);
   OrdinaryPages().erase(this);
+
+  // Shuttle: if this page carried a persona time zone / locale, re-derive the
+  // process-wide value from the remaining pages (clears it if none carries one).
+  if (!renderer_preferences_.timezone_override.empty() ||
+      !renderer_preferences_.locale_override.empty()) {
+    ApplyPersonaIntlOverrides(/*page_is_going_away=*/true);
+  }
 
   {
     // Before: ... -> prev -> this -> next -> ...

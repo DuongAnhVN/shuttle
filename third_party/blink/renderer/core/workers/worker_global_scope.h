@@ -35,6 +35,7 @@
 #include "services/network/public/mojom/fetch_api.mojom-blink-forward.h"
 #include "third_party/blink/public/common/permissions_policy/document_policy.h"
 #include "third_party/blink/public/common/tokens/tokens.h"
+#include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
 #include "third_party/blink/public/mojom/loader/code_cache.mojom-blink-forward.h"
 #include "third_party/blink/public/mojom/script/script_type.mojom-blink-forward.h"
 #include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
@@ -147,7 +148,10 @@ class CORE_EXPORT WorkerGlobalScope
   bool IsWorkerGlobalScope() const final { return true; }
   bool IsContextThread() const final;
   const KURL& BaseURL() const final;
-  String UserAgent() const final { return user_agent_; }
+  // Shuttle: for a shared or service worker, the profile persona's user agent
+  // from the worker's renderer preferences when it has one (see
+  // PersonaUserAgentOverride); otherwise what the browser passed at creation.
+  String UserAgent() const final;
   UserAgentMetadata GetUserAgentMetadata() const override;
   HttpsState GetHttpsState() const override { return https_state_; }
   scheduler::WorkerScheduler* GetScheduler() final;
@@ -363,6 +367,15 @@ class CORE_EXPORT WorkerGlobalScope
 
  private:
   void SetWorkerSettings(std::unique_ptr<WorkerSettings>);
+
+  // Shuttle: the user agent override (string and client hints) of the profile
+  // persona carried by this worker's renderer preferences, or null. Only shared
+  // and service workers use it: the browser creates them with the stock user
+  // agent (ContentBrowserClient::GetUserAgent has no BrowserContext), whereas a
+  // dedicated worker inherits its parent's, which already reflects the
+  // persona. Null as well when the preferences have no override (no persona, or
+  // a worker without a fetch context).
+  const UserAgentOverride* PersonaUserAgentOverride() const;
 
   // https://html.spec.whatwg.org/C/#run-a-worker Step 24.
   void RunWorkerScript();

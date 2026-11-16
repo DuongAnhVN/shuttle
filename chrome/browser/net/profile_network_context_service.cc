@@ -42,6 +42,8 @@
 #include "chrome/browser/net/system_network_context_manager.h"
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/shuttle/agent_partition.h"
+#include "chrome/browser/shuttle/profile_persona_service.h"
+#include "chrome/browser/shuttle/profile_persona_service_factory.h"
 #include "chrome/browser/shuttle/profile_proxy_service.h"
 #include "chrome/browser/shuttle/profile_proxy_service_factory.h"
 #include "chrome/browser/signin/signin_util.h"
@@ -453,6 +455,12 @@ ProfileNetworkContextService::ProfileNetworkContextService(Profile* profile)
                           base::Unretained(this)));
   cookie_settings_ = CookieSettingsFactory::GetForProfile(profile);
   cookie_settings_observation_.Observe(cookie_settings_.get());
+  if (shuttle::ProfilePersonaService* personas =
+          shuttle::ProfilePersonaServiceFactory::GetForProfile(profile)) {
+    persona_subscription_ = personas->AddChangeCallback(base::BindRepeating(
+        &ProfileNetworkContextService::UpdateAcceptLanguage,
+        base::Unretained(this)));
+  }
 
   DisableQuicIfNotAllowed();
 
@@ -610,7 +618,18 @@ void ProfileNetworkContextService::DisableQuicIfNotAllowed() {
 }
 
 void ProfileNetworkContextService::UpdateAcceptLanguage() {
-  const std::string accept_language = ComputeAcceptLanguage();
+  std::string accept_language = ComputeAcceptLanguage();
+  // A profile with a fingerprint persona sends the persona's languages (the
+  // same as the renderers' navigator.languages) from every partition, not the
+  // profile's.
+  if (shuttle::ProfilePersonaService* personas =
+          shuttle::ProfilePersonaServiceFactory::GetForProfileIfExists(
+              profile_)) {
+    if (std::optional<std::string> persona_language =
+            personas->AcceptLanguageHeader()) {
+      accept_language = std::move(*persona_language);
+    }
+  }
   profile_->ForEachLoadedStoragePartition(
       [&](content::StoragePartition* storage_partition) {
         storage_partition->GetNetworkContext()->SetAcceptLanguage(
@@ -1344,6 +1363,13 @@ void ProfileNetworkContextService::ConfigureNetworkContextParamsInternal(
     proxies->ConfigureNetworkContextParams(relative_partition_path,
                                            network_context_params);
   }
+  // A profile with a fingerprint persona sends the persona's Accept-Language
+  // and user agent from all its NetworkContexts (main and partitions), not
+  // the profile's.
+  if (shuttle::ProfilePersonaService* personas =
+          shuttle::ProfilePersonaServiceFactory::GetForProfile(profile_)) {
+    personas->ConfigureNetworkContextParams(network_context_params);
+  }
 
   network_context_params->enable_certificate_reporting = true;
 
@@ -1543,6 +1569,7 @@ void ProfileNetworkContextService::Shutdown() {
   }
 #endif
 
+  persona_subscription_ = base::CallbackListSubscription();
   pref_change_registrar_.RemoveAll();
   enable_referrers_.Destroy();
   pref_accept_language_.Destroy();

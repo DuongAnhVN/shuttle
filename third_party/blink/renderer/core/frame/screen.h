@@ -44,6 +44,7 @@ struct ScreenInfo;
 namespace blink {
 
 class LocalDOMWindow;
+struct RendererPreferences;
 
 class CORE_EXPORT Screen : public EventTarget,
                            public ExecutionContextClient,
@@ -88,6 +89,9 @@ class CORE_EXPORT Screen : public EventTarget,
   // Helpers to access screen information.
   gfx::Rect GetRect(bool available) const;
   const display::ScreenInfo& GetScreenInfo() const;
+  // Shuttle: the page's renderer preferences, which carry the profile's persona
+  // screen values; null without a window or page.
+  const RendererPreferences* GetPersonaPreferences() const;
 
   // The internal id of the underlying display, to support multi-screen devices.
   int64_t display_id_;

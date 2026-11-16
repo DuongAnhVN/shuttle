@@ -161,8 +161,9 @@ TimeZoneController::SetTimeZoneOverride(const String& timezone_id) {
     return {TimeZoneOverrideStatus::kAlreadyInEffect, nullptr};
   }
 
-  // Only notify if the override and the host are different.
-  if (!CanonicalEquals(timezone_id, instance().GetHostTimezoneId())) {
+  // Only notify if the override and the base (persona, else host) zone are
+  // different.
+  if (!CanonicalEquals(timezone_id, instance().GetBaseTimezoneId())) {
     if (!SetIcuTimeZoneAndNotifyV8(timezone_id)) {
       VLOG(1) << "Invalid override timezone id: " << timezone_id;
       return {TimeZoneOverrideStatus::kInvalidTimezone, nullptr};
@@ -192,11 +193,11 @@ void TimeZoneController::ClearTimeZoneOverride() {
 
   DCHECK(HasTimeZoneOverride());
 
-  if (!CanonicalEquals(instance().GetHostTimezoneId(),
+  if (!CanonicalEquals(instance().GetBaseTimezoneId(),
                        instance().override_timezone_id_)) {
-    // Restore remembered timezone request.
-    // Only do so if the host timezone is now different.
-    SetIcuTimeZoneAndNotifyV8(instance().GetHostTimezoneId());
+    // Restore remembered timezone request (the persona's zone, else the
+    // host's). Only do so if that zone is now different.
+    SetIcuTimeZoneAndNotifyV8(instance().GetBaseTimezoneId());
   }
   instance().override_timezone_id_ = String();
 }
@@ -257,8 +258,50 @@ void TimeZoneController::OnTimeZoneChange(const String& timezone_id) {
   // override is removed.
   instance().host_timezone_id_ = timezone_id;
 
-  if (!HasTimeZoneOverride())
+  // A persona zone replaces the host's: the host change is only remembered.
+  if (!HasTimeZoneOverride() && instance().persona_timezone_id_.empty()) {
     SetIcuTimeZoneAndNotifyV8(timezone_id);
+  }
+}
+
+// static
+bool TimeZoneController::SetPersonaTimeZone(const String& timezone_id) {
+  TimeZoneController& self = instance();
+  base::AutoLock locker(self.lock_);
+
+  if (self.persona_timezone_id_.empty() && timezone_id.empty()) {
+    return true;
+  }
+  if (!timezone_id.empty()) {
+    if (CanonicalEquals(self.persona_timezone_id_, timezone_id) &&
+        !self.persona_timezone_id_.empty()) {
+      return true;
+    }
+    // Validate before touching any state.
+    std::unique_ptr<icu::TimeZone> timezone(icu::TimeZone::createTimeZone(
+        icu::UnicodeString(timezone_id.Ascii().data(), -1, US_INV)));
+    CHECK(timezone);
+    if (*timezone == icu::TimeZone::getUnknown()) {
+      VLOG(1) << "Invalid persona timezone id: " << timezone_id;
+      return false;
+    }
+  }
+
+  const String previous_base = self.GetBaseTimezoneId();
+  self.persona_timezone_id_ = timezone_id;
+  const String& new_base = self.GetBaseTimezoneId();
+  // While a DevTools override is held it stays in effect; it falls back to
+  // the new base zone when released (ClearTimeZoneOverride).
+  if (!HasTimeZoneOverride() && !CanonicalEquals(previous_base, new_base)) {
+    SetIcuTimeZoneAndNotifyV8(new_base);
+  }
+  return true;
+}
+
+const String& TimeZoneController::GetBaseTimezoneId() {
+  lock_.AssertAcquired();
+  return persona_timezone_id_.empty() ? GetHostTimezoneId()
+                                      : persona_timezone_id_;
 }
 
 const String& TimeZoneController::GetHostTimezoneId() {

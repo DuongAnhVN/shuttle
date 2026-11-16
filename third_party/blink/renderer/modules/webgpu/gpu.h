@@ -72,6 +72,10 @@ class MODULES_EXPORT GPU final : public ScriptWrappable,
       scoped_refptr<DawnControlClientHolder> dawn_control_client);
 
  private:
+  // Shuttle: whether the profile's fingerprint persona blocks WebGPU
+  // (RendererPreferences::webgpu_blocked of the page or worker).
+  bool IsBlockedByPersona() const;
+
   void OnRequestAdapterCallback(
       ScriptState* script_state,
       const GPURequestAdapterOptions* options,

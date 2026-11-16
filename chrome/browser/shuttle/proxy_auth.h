@@ -64,15 +64,34 @@ std::unique_ptr<content::LoginDelegate> CreateAgentProxyLoginDelegate(
     content::LoginDelegate::LoginAuthRequiredCallback auth_required_callback);
 
 // Sets the WebRTC IP handling policy of `prefs` (the renderer preferences of
-// `contents`) when `contents` is an agent tab. An agent with a proxy
-// (ProfileProxyService::Lookup is not kNone) gets disable_non_proxied_udp, so
-// WebRTC cannot reveal the real IP; its per-URL rules (webrtc_ip_handling_urls)
-// are cleared, since a matching rule would otherwise override that policy. Any
-// other agent gets the profile's setting. Other tabs are not touched. Call it
-// after renderer_preferences_util::UpdateFromSystemSettings.
+// `contents`). A tab whose agent has a proxy (ProfileProxyService::Lookup is
+// not kNone), and EVERY tab of a profile whose own proxy preference names a
+// proxy (webrtc_policy.h, ProfileHasExplicitProxy), gets
+// disable_non_proxied_udp, so WebRTC cannot reveal the real IP; its per-URL
+// rules (webrtc_ip_handling_urls) are cleared, since a matching rule would
+// otherwise override that policy. Any other agent gets the profile's setting
+// (kWebRTCIPHandlingPolicy); other tabs keep what UpdateFromSystemSettings set.
+// Native policy only: no spoofing of getStats, SDP or candidates. Call it after
+// renderer_preferences_util::UpdateFromSystemSettings.
+//
+// For EVERY tab of the profile (agent or not) it first applies the profile's
+// fingerprint persona (ProfilePersonaService, ApplyProfilePersonaToWebContents
+// in persona_tab_prefs.h): user agent and client hints, languages, platform,
+// hardware concurrency, device memory, screen size and color depth,
+// devicePixelRatio. A profile without a readable persona keeps its values; a
+// persona applied earlier and since removed is cleared. The persona does not
+// depend on the agent or its partition.
 void ApplyAgentRendererPrefs(Profile* profile,
                              content::WebContents* contents,
                              blink::RendererPreferences* prefs);
+
+// Worker counterpart of the WebRTC part of ApplyAgentRendererPrefs. The agent
+// of a worker cannot be attributed, so only the profile's own explicit proxy
+// is considered: with one, `prefs` get disable_non_proxied_udp; otherwise they
+// are left untouched. An agent's own proxy does not reach its workers (known
+// gap). Call it after UpdateFromSystemSettings; null arguments are ignored.
+void ApplyProfileWebRtcPolicyToWorkerPrefs(Profile* profile,
+                                           blink::RendererPreferences* prefs);
 
 }  // namespace shuttle
 

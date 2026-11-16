@@ -305,6 +305,65 @@ struct BLINK_COMMON_EXPORT
     return data.global_privacy_control_devtools_override;
   }
 
+  static const std::string& navigator_platform_override(
+      const ::blink::RendererPreferences& data) {
+    return data.navigator_platform_override;
+  }
+
+  static uint32_t hardware_concurrency_override(
+      const ::blink::RendererPreferences& data) {
+    return data.hardware_concurrency_override;
+  }
+
+  static float device_memory_override(
+      const ::blink::RendererPreferences& data) {
+    return data.device_memory_override;
+  }
+
+  static int32_t screen_width_override(
+      const ::blink::RendererPreferences& data) {
+    return data.screen_width_override;
+  }
+
+  static int32_t screen_height_override(
+      const ::blink::RendererPreferences& data) {
+    return data.screen_height_override;
+  }
+
+  static int32_t screen_color_depth_override(
+      const ::blink::RendererPreferences& data) {
+    return data.screen_color_depth_override;
+  }
+
+  static float device_pixel_ratio_override(
+      const ::blink::RendererPreferences& data) {
+    return data.device_pixel_ratio_override;
+  }
+
+  static const std::string& webgl_unmasked_vendor_override(
+      const ::blink::RendererPreferences& data) {
+    return data.webgl_unmasked_vendor_override;
+  }
+
+  static const std::string& webgl_unmasked_renderer_override(
+      const ::blink::RendererPreferences& data) {
+    return data.webgl_unmasked_renderer_override;
+  }
+
+  static const std::string& timezone_override(
+      const ::blink::RendererPreferences& data) {
+    return data.timezone_override;
+  }
+
+  static const std::string& locale_override(
+      const ::blink::RendererPreferences& data) {
+    return data.locale_override;
+  }
+
+  static bool webgpu_blocked(const ::blink::RendererPreferences& data) {
+    return data.webgpu_blocked;
+  }
+
   static bool Read(blink::mojom::RendererPreferencesDataView,
                    ::blink::RendererPreferences* out);
 };

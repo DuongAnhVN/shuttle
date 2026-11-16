@@ -33,6 +33,7 @@
 #include "mojo/public/cpp/bindings/pending_remote.h"
 #include "services/metrics/public/cpp/mojo_ukm_recorder.h"
 #include "third_party/blink/public/common/loader/javascript_framework_detection.h"
+#include "third_party/blink/public/common/renderer_preferences/renderer_preferences.h"
 #include "third_party/blink/public/common/thread_safe_browser_interface_broker_proxy.h"
 #include "third_party/blink/public/mojom/browser_interface_broker.mojom-blink.h"
 #include "third_party/blink/public/mojom/devtools/inspector_issue.mojom-blink.h"
@@ -204,10 +205,37 @@ const KURL& WorkerGlobalScope::BaseURL() const {
   return Url();
 }
 
+const UserAgentOverride* WorkerGlobalScope::PersonaUserAgentOverride() const {
+  if (!IsSharedWorkerGlobalScope() && !IsServiceWorkerGlobalScope()) {
+    return nullptr;
+  }
+  // The profile of the worker (the persona is the profile's), never a
+  // process-wide value. A scope without a fetch context reports default
+  // preferences, i.e. no override.
+  const UserAgentOverride& ua_override =
+      GetRendererPreferences().user_agent_override;
+  return ua_override.ua_string_override.empty() ? nullptr : &ua_override;
+}
+
+String WorkerGlobalScope::UserAgent() const {
+  if (const UserAgentOverride* ua_override = PersonaUserAgentOverride()) {
+    return String::FromUtf8(ua_override->ua_string_override);
+  }
+  return user_agent_;
+}
+
 UserAgentMetadata WorkerGlobalScope::GetUserAgentMetadata() const {
   std::optional<UserAgentMetadata> optional_metadata;
   if (CoreProbeSink* sink = probe::ToCoreProbeSink(GetExecutionContext())) {
     probe::ApplyUserAgentMetadataOverride(sink, &optional_metadata);
+  }
+  if (!optional_metadata) {
+    // No DevTools override: the persona's client hints, if any (a persona's
+    // override always carries metadata; with a user agent string but none, the
+    // browser's stock hints would not match it, so they are not used).
+    if (const UserAgentOverride* ua_override = PersonaUserAgentOverride()) {
+      return ua_override->ua_metadata_override.value_or(UserAgentMetadata());
+    }
   }
   return optional_metadata.value_or(ua_metadata_);
 }

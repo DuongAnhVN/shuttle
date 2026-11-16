@@ -224,4 +224,53 @@ struct RendererPreferences {
   // `is_global_privacy_control_setting_enabled`. If null, no override is set
   // and the embedder's setting applies.
   bool? global_privacy_control_devtools_override;
+
+  // Shuttle: the values of the profile's fingerprint persona that the renderer
+  // reports to pages (navigator.platform, navigator.hardwareConcurrency,
+  // navigator.deviceMemory, screen.width/height/availWidth/availHeight,
+  // screen.colorDepth/pixelDepth, window.devicePixelRatio), in the page and in
+  // its dedicated workers. An empty string or 0 means no override: the renderer
+  // reports the real value, as in stock Chromium.
+  string navigator_platform_override;
+  uint32 hardware_concurrency_override = 0;
+  float device_memory_override = 0;
+  int32 screen_width_override = 0;
+  int32 screen_height_override = 0;
+  int32 screen_color_depth_override = 0;
+  float device_pixel_ratio_override = 0;
+
+  // Shuttle: what WebGLRenderingContext.getParameter returns for
+  // UNMASKED_VENDOR_WEBGL and UNMASKED_RENDERER_WEBGL (WEBGL_debug_renderer_info),
+  // in the page and in its dedicated workers. Applied only when both are
+  // non-empty; empty means the real GPU strings, as in stock Chromium. No other
+  // WebGL value (VENDOR, RENDERER, VERSION, GLSL version, limits, extensions) is
+  // changed.
+  string webgl_unmasked_vendor_override;
+  string webgl_unmasked_renderer_override;
+
+  // Shuttle: the time zone (IANA id, "Europe/Paris") and the locale (BCP 47,
+  // "fr-FR") of the profile's fingerprint persona. The renderer applies them
+  // as its process-wide ICU default time zone / locale (V8 is notified), so
+  // Date, Intl.* and every worker thread of that renderer process follow.
+  // ICU's defaults are PROCESS-global and Blink cannot isolate them per page:
+  // the setting reaches every page and worker thread of the renderer process.
+  // The embedder must therefore only send a value to renderer processes that
+  // serve a single profile: content never shares a renderer process between
+  // BrowserContexts (RenderProcessHostImpl::IsSuitableHost), but renderers
+  // running in the browser process (--single-process) do share, and there the
+  // Shuttle embedder sends neither field (persona_tab_prefs.cc). An empty
+  // string means no override: the host time zone / the embedder's locale. A
+  // DevTools emulation override still wins over these while it is active.
+  string timezone_override;
+  string locale_override;
+
+  // Shuttle: when true, WebGPU is blocked for the page and its workers:
+  // navigator.gpu still exists, but GPU.requestAdapter() resolves with null
+  // (as on a machine without a usable GPU) and no adapter, device, adapter
+  // limit or feature is ever exposed. Set by the embedder when the profile's
+  // fingerprint persona cannot be matched by the host adapter (the persona
+  // claims another OS or a WebGL GPU string: the real adapter would
+  // contradict it). Nothing about the adapter is ever fabricated. false =
+  // stock behavior (the host adapter is exposed).
+  bool webgpu_blocked = false;
 };

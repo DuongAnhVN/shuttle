@@ -17,10 +17,13 @@
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/shuttle/agent_partition.h"
 #include "chrome/browser/shuttle/agent_proxy.h"
+#include "chrome/browser/shuttle/persona_tab_prefs.h"
 #include "chrome/browser/shuttle/profile_proxy_service.h"
 #include "chrome/browser/shuttle/profile_proxy_service_factory.h"
+#include "chrome/browser/shuttle/webrtc_policy.h"
 #include "chrome/common/pref_names.h"
 #include "components/prefs/pref_service.h"
+#include "content/public/browser/web_contents.h"
 #include "net/base/auth.h"
 #include "third_party/blink/public/common/peerconnection/webrtc_ip_handling_policy.h"
 #include "third_party/blink/public/common/renderer_preferences/renderer_preferences.h"
@@ -150,21 +153,38 @@ std::unique_ptr<content::LoginDelegate> CreateAgentProxyLoginDelegate(
 void ApplyAgentRendererPrefs(Profile* profile,
                              content::WebContents* contents,
                              blink::RendererPreferences* prefs) {
-  std::string agent_id = AgentIdForWebContents(contents);
-  if (agent_id.empty() || !profile || !prefs) {
+  if (!profile || !contents || !prefs) {
     return;
   }
 
-  if (AgentHasProxy(profile, agent_id)) {
-    prefs->webrtc_ip_handling_policy =
-        blink::mojom::WebRtcIpHandlingPolicy::kDisableNonProxiedUdp;
-    // A profile-wide per-URL rule matching this page would override the
-    // policy above: drop them for this tab.
-    prefs->webrtc_ip_handling_urls.clear();
+  // The fingerprint persona belongs to the profile: every tab gets it, agent
+  // or not.
+  ApplyProfilePersonaToWebContents(profile, contents, prefs);
+
+  // WebRTC: disable_non_proxied_udp (per-URL rules dropped) for a tab whose
+  // agent has a proxy, and for EVERY tab (agent or not) of a profile with an
+  // explicit proxy of its own. Otherwise the profile's own setting stands.
+  std::string agent_id = AgentIdForWebContents(contents);
+  bool agent_has_proxy = !agent_id.empty() && AgentHasProxy(profile, agent_id);
+  if (ApplyProxiedWebRtcPolicy(profile->GetPrefs(), agent_has_proxy, prefs)) {
+    return;
+  }
+  if (agent_id.empty()) {
     return;
   }
   prefs->webrtc_ip_handling_policy = blink::ToWebRTCIPHandlingPolicy(
-      profile->GetPrefs()->GetString(prefs::kWebRTCIPHandlingPolicy));
+      profile->GetPrefs()->GetString(::prefs::kWebRTCIPHandlingPolicy));
+}
+
+void ApplyProfileWebRtcPolicyToWorkerPrefs(Profile* profile,
+                                           blink::RendererPreferences* prefs) {
+  if (!profile) {
+    return;
+  }
+  // No agent here (see UpdateRendererPreferencesForWorker): only the profile's
+  // own explicit proxy can be taken into account.
+  ApplyProxiedWebRtcPolicy(profile->GetPrefs(), /*agent_has_proxy=*/false,
+                           prefs);
 }
 
 }  // namespace shuttle

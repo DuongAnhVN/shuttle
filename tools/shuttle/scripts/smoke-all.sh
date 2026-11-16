@@ -4,7 +4,7 @@
 # the PID it started), checks the exit status and the log for fatals, removes its temp dir, prints PASS/FAIL/SKIP.
 # Usage: scripts/smoke-all.sh <binary|Shuttle.app> [--with network,push,automation] [--mode headless|x11|wayland]
 #   Default: cdp, session-cdp, agents-page, isolation (agent storage across blank tabs), focus, sandbox (Linux only: the page is not built on macOS), mcp phase 1,
-#   restart on the same profile, mcp phase 2, tab-guards, page-tools (2x), throwaway, proxy. Opt-in: network (own launch with --shuttle-listen=0.0.0.0, LAN),
+#   restart on the same profile, mcp phase 2, tab-guards, page-tools (2x), throwaway, proxy, fingerprint-persona. Opt-in: network (own launch with --shuttle-listen=0.0.0.0, LAN),
 #   push (needs SHUTTLE_SMOKE_NET=1, else SKIP), automation (own launch: --enable-automation, no debug port; binds
 #   9222 when free, else a free port). x11/wayland use the WSLg defaults (DISPLAY=:0, /mnt/wslg/runtime-dir) unless
 #   set. Run it under nice -n 19 on a shared machine. Env: SHUTTLE_SMOKE_READY_S (startup deadline, default 30).
@@ -117,6 +117,19 @@ else note launch-throwaway FAIL; stop; fi
 if launch "$tmp/proxy" --remote-debugging-port=0; then
   probe proxy 180 smoke-proxy.mjs "$tmp/proxy"; closed proxy
 else note launch-proxy FAIL; stop; fi
+# Fingerprint persona (ONE per Chromium profile, shared by all agents): own launch on a seeded profile (a valid persisted
+# profile persona plus a legacy per-agent one that must be ignored); its udd is read for the Preferences checks. The
+# runtime probe (headers and page values with a profile persona, sharing between agents, update, clear) runs on the
+# same launch, after the schema probe has cleaned up. A second launch seeds a corrupt persona (unreadable, never applied).
+node "$here/smoke-fingerprint-persona-seed.mjs" "$tmp/fingerprint"
+if launch "$tmp/fingerprint" --remote-debugging-port=0; then
+  probe fingerprint-persona 180 smoke-fingerprint-persona.mjs "$tmp/fingerprint"
+  probe fingerprint-runtime 180 smoke-fingerprint-runtime.mjs; closed fingerprint
+else note launch-fingerprint FAIL; stop; fi
+node "$here/smoke-fingerprint-persona-seed.mjs" "$tmp/fingerprint-corrupt" badversion
+if launch "$tmp/fingerprint-corrupt" --remote-debugging-port=0; then
+  probe fingerprint-corrupt 60 smoke-fingerprint-persona.mjs "$tmp/fingerprint-corrupt" corrupt; closed fingerprint-corrupt
+else note launch-fingerprint-corrupt FAIL; stop; fi
 if [[ $with == *,network,* ]]; then
   if launch "$tmp/net" --remote-debugging-port=0 --shuttle-listen=0.0.0.0; then
     probe network 60 smoke-network.mjs "$tmp/net"; closed network

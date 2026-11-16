@@ -13,6 +13,7 @@
 #include "gpu/command_buffer/client/webgpu_interface.h"
 #include "gpu/config/gpu_finch_features.h"
 #include "mojo/public/cpp/bindings/remote.h"
+#include "third_party/blink/public/common/renderer_preferences/renderer_preferences.h"
 #include "third_party/blink/public/common/thread_safe_browser_interface_broker_proxy.h"
 #include "third_party/blink/public/mojom/gpu/gpu.mojom-blink.h"
 #include "third_party/blink/public/mojom/use_counter/metrics/web_feature.mojom-shared.h"
@@ -376,6 +377,19 @@ void GPU::RequestAdapterImpl(
 ScriptPromise<IDLNullable<GPUAdapter>> GPU::requestAdapter(
     ScriptState* script_state,
     const GPURequestAdapterOptions* options) {
+  // Shuttle: the profile's fingerprint persona blocks WebGPU (the host adapter
+  // would contradict it): resolve null, like a machine without a usable GPU.
+  // Nothing of the adapter is created or faked, and the GPU process is not
+  // contacted (no context provider is made, so no console message either).
+  if (IsBlockedByPersona()) {
+    auto* blocked_resolver =
+        MakeGarbageCollected<ScriptPromiseResolver<IDLNullable<GPUAdapter>>>(
+            script_state);
+    auto blocked_promise = blocked_resolver->Promise();
+    blocked_resolver->Resolve(static_cast<GPUAdapter*>(nullptr));
+    return blocked_promise;
+  }
+
   // Remind developers when they are using WebGPU on unsupported platforms.
   ExecutionContext* execution_context = GetExecutionContext();
   if (execution_context &&
@@ -394,6 +408,13 @@ ScriptPromise<IDLNullable<GPUAdapter>> GPU::requestAdapter(
   auto promise = resolver->Promise();
   RequestAdapterImpl(script_state, options, resolver);
   return promise;
+}
+
+bool GPU::IsBlockedByPersona() const {
+  NavigatorBase* navigator = GetSupplementable();
+  const RendererPreferences* prefs =
+      navigator ? navigator->GetRendererPreferencesForPersona() : nullptr;
+  return prefs && prefs->webgpu_blocked;
 }
 
 V8GPUTextureFormat GPU::getPreferredCanvasFormat() {

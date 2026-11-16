@@ -11,7 +11,8 @@ namespace blink {
 
 class CORE_EXPORT NavigatorDeviceMemory {
  public:
-  float deviceMemory() const;
+  // Virtual: NavigatorBase overrides it with the profile persona's value.
+  virtual float deviceMemory() const;
 };
 
 }  // namespace blink

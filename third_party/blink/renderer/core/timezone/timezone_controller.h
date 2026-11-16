@@ -78,6 +78,21 @@ class CORE_EXPORT TimeZoneController final
 
   static void ChangeTimeZoneForTesting(const String&);
 
+  // Shuttle: sets (or, with an empty id, removes) the base time zone of this
+  // renderer process that replaces the host system's: the profile's
+  // fingerprint persona (RendererPreferences::timezone_override). Unlike
+  // SetTimeZoneOverride it is not exclusive: it is the zone the process falls
+  // back to, so a DevTools override acquired through SetTimeZoneOverride still
+  // takes precedence while it is held, and the persona zone is restored when
+  // it is released. Host time zone changes are remembered but not applied
+  // while a persona zone is set. The ICU default time zone is PROCESS-global:
+  // this changes it for every page and worker of the process, with no
+  // per-page isolation. Keeping it inside one profile is the embedder's job
+  // (it only sends the value to renderer processes of that profile; content
+  // does not share a renderer process between BrowserContexts). Returns false
+  // (nothing changes) for an unknown zone id.
+  static bool SetPersonaTimeZone(const String& timezone_id);
+
  private:
   TimeZoneController();
   static TimeZoneController& instance();
@@ -88,6 +103,8 @@ class CORE_EXPORT TimeZoneController final
   static bool SetIcuTimeZoneAndNotifyV8(const String& timezone_id);
 
   const String& GetHostTimezoneId();
+  // The zone without a DevTools override: the persona's, else the host's.
+  const String& GetBaseTimezoneId();
 
   // device::mojom::blink::TimeZoneMonitorClient:
   void OnTimeZoneChange(const String& timezone_id) override;
@@ -100,6 +117,8 @@ class CORE_EXPORT TimeZoneController final
 
   String host_timezone_id_ GUARDED_BY(lock_);
   String override_timezone_id_ GUARDED_BY(lock_);
+  // Shuttle: the persona's zone, empty if none.
+  String persona_timezone_id_ GUARDED_BY(lock_);
 };
 
 }  // namespace blink

@@ -620,6 +620,7 @@ source_set("profiles_extra_parts_impl") {
     "//chrome/browser:font_pref",
     "//chrome/browser/accessibility",
     "//chrome/browser/shuttle",
+    "//chrome/browser/shuttle:agent_persona",
     "//chrome/browser/shuttle:agent_proxy",
     "//chrome/browser/autocomplete",
     "//chrome/browser/background",

@@ -5,6 +5,7 @@
 #include "chrome/browser/shuttle/shuttle_service_factory.h"
 
 #include "chrome/browser/shuttle/shuttle_service.h"
+#include "chrome/browser/shuttle/profile_persona_service_factory.h"
 #include "chrome/browser/shuttle/profile_proxy_service_factory.h"
 #include "chrome/browser/shuttle/profile_registry.h"
 #include "chrome/browser/profiles/profile.h"
@@ -31,8 +32,10 @@ ShuttleServiceFactory::ShuttleServiceFactory()
           ProfileSelections::Builder()
               .WithRegular(ProfileSelection::kOriginalOnly)
               .Build()) {
-  // ShuttleService's ProxyTabSync observes the proxy service: the proxy
-  // service must be destroyed after the ShuttleService.
+  // ShuttleService's ProxyTabSync observes the proxy and persona services
+  // (and the MCP fingerprint tools write the persona through the latter): they
+  // must be destroyed after the ShuttleService.
+  DependsOn(ProfilePersonaServiceFactory::GetInstance());
   DependsOn(ProfileProxyServiceFactory::GetInstance());
 }
 

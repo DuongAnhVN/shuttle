@@ -140,6 +140,27 @@ bool StructTraits<blink::mojom::RendererPreferencesDataView,
   out->global_privacy_control_devtools_override =
       data.global_privacy_control_devtools_override();
 
+  if (!data.ReadNavigatorPlatformOverride(&out->navigator_platform_override)) {
+    return false;
+  }
+  out->hardware_concurrency_override = data.hardware_concurrency_override();
+  out->device_memory_override = data.device_memory_override();
+  out->screen_width_override = data.screen_width_override();
+  out->screen_height_override = data.screen_height_override();
+  out->screen_color_depth_override = data.screen_color_depth_override();
+  out->device_pixel_ratio_override = data.device_pixel_ratio_override();
+  if (!data.ReadWebglUnmaskedVendorOverride(
+          &out->webgl_unmasked_vendor_override) ||
+      !data.ReadWebglUnmaskedRendererOverride(
+          &out->webgl_unmasked_renderer_override)) {
+    return false;
+  }
+  if (!data.ReadTimezoneOverride(&out->timezone_override) ||
+      !data.ReadLocaleOverride(&out->locale_override)) {
+    return false;
+  }
+  out->webgpu_blocked = data.webgpu_blocked();
+
   return true;
 }
 

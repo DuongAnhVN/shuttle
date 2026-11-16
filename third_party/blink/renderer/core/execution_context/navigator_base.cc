@@ -7,9 +7,14 @@
 #include "base/feature_list.h"
 #include "build/build_config.h"
 #include "third_party/blink/public/common/features.h"
+#include "third_party/blink/public/common/renderer_preferences/renderer_preferences.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+#include "third_party/blink/renderer/core/frame/local_dom_window.h"
+#include "third_party/blink/renderer/core/frame/local_frame.h"
 #include "third_party/blink/renderer/core/frame/navigator_concurrent_hardware.h"
+#include "third_party/blink/renderer/core/page/page.h"
 #include "third_party/blink/renderer/core/probe/core_probes.h"
+#include "third_party/blink/renderer/core/workers/worker_or_worklet_global_scope.h"
 #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
 #include "third_party/blink/renderer/platform/wtf/text/string_builder.h"
 
@@ -66,7 +71,25 @@ String NavigatorBase::userAgent() const {
   return execution_context ? execution_context->UserAgent() : String();
 }
 
+const RendererPreferences* NavigatorBase::GetRendererPreferencesForPersona()
+    const {
+  if (LocalDOMWindow* window = DomWindow()) {
+    LocalFrame* frame = window->GetFrame();
+    Page* page = frame ? frame->GetPage() : nullptr;
+    return page ? &page->GetRendererPreferences() : nullptr;
+  }
+  if (auto* worker_scope =
+          DynamicTo<WorkerOrWorkletGlobalScope>(GetExecutionContext())) {
+    return &worker_scope->GetRendererPreferences();
+  }
+  return nullptr;
+}
+
 String NavigatorBase::platform() const {
+  if (const RendererPreferences* prefs = GetRendererPreferencesForPersona();
+      prefs && !prefs->navigator_platform_override.empty()) {
+    return String::FromUtf8(prefs->navigator_platform_override);
+  }
 #if BUILDFLAG(IS_ANDROID)
   // We need to check the ReduceUserAgentMinorVersion feature flag for
   // Android WebView, which does not currently ship a reduced User-Agent.
@@ -87,10 +110,24 @@ void NavigatorBase::Trace(Visitor* visitor) const {
 unsigned int NavigatorBase::hardwareConcurrency() const {
   unsigned int hardware_concurrency =
       NavigatorConcurrentHardware::hardwareConcurrency();
+  if (const RendererPreferences* prefs = GetRendererPreferencesForPersona();
+      prefs && prefs->hardware_concurrency_override > 0) {
+    // The profile's persona wins over the real core count (DevTools emulation,
+    // below, still wins over the persona).
+    hardware_concurrency = prefs->hardware_concurrency_override;
+  }
 
   probe::ApplyHardwareConcurrencyOverride(
       probe::ToCoreProbeSink(GetExecutionContext()), hardware_concurrency);
   return hardware_concurrency;
+}
+
+float NavigatorBase::deviceMemory() const {
+  if (const RendererPreferences* prefs = GetRendererPreferencesForPersona();
+      prefs && prefs->device_memory_override > 0) {
+    return prefs->device_memory_override;
+  }
+  return NavigatorDeviceMemory::deviceMemory();
 }
 
 ExecutionContext* NavigatorBase::GetUAExecutionContext() const {

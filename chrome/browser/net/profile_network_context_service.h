@@ -244,6 +244,10 @@ class ProfileNetworkContextService
 
   raw_ptr<Profile> profile_;
 
+  // Shuttle: re-sends the Accept-Language of the profile's NetworkContexts when
+  // the profile's fingerprint persona changes (UpdateAcceptLanguage).
+  base::CallbackListSubscription persona_subscription_;
+
   std::unique_ptr<ProxyConfigMonitor> proxy_config_monitor_;
 
   BooleanPrefMember quic_allowed_;

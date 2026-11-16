@@ -16,6 +16,7 @@
 #include "base/functional/callback.h"
 #include "base/json/json_writer.h"
 #include "base/i18n/time_formatting.h"
+#include "base/rand_util.h"
 #include "base/strings/strcat.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/string_util.h"
@@ -24,7 +25,11 @@
 #include "base/timer/timer.h"
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/shuttle/agent_proxy.h"
+#include "chrome/browser/shuttle/fingerprint_persona.h"
 #include "chrome/browser/shuttle/network_access.h"
+#include "chrome/browser/shuttle/persona_runtime.h"
+#include "chrome/browser/shuttle/profile_persona_service.h"
+#include "chrome/browser/shuttle/profile_persona_service_factory.h"
 #include "chrome/browser/shuttle/profile_proxy_service.h"
 #include "chrome/browser/shuttle/profile_proxy_service_factory.h"
 #include "chrome/browser/shuttle/profile_registry.h"
@@ -280,6 +285,109 @@ bool ApplyProxyChange(const ToolContext& context,
   return ProxyServiceOf(context)->Set(id, change.proxy);
 }
 
+// Fingerprint ---------------------------------------------------------------
+//
+// One persona per Chromium profile, shared by every tab and agent: the tools
+// below read and write the profile's, never an agent's.
+
+constexpr char kNoPersonaService[] =
+    "The fingerprint persona is not available here";
+constexpr char kFingerprintIsProfileLevel[] =
+    "fingerprint is profile-level, not per agent: use set-fingerprint (it "
+    "applies to every tab and agent of the browser profile)";
+
+ProfilePersonaService* PersonaServiceOf(const ToolContext& context) {
+  return ProfilePersonaServiceFactory::GetForProfile(context.service->profile());
+}
+
+// null (no persona), the persona without its seed, or {unreadable: true} when
+// the stored persona can't be read. Never the seed.
+base::Value DescribeFingerprint(const ToolContext& context) {
+  ProfilePersonaService* service = PersonaServiceOf(context);
+  if (!service) {
+    return base::Value();
+  }
+  StoredFingerprintPersona stored = service->Lookup();
+  switch (stored.state) {
+    case StoredFingerprintPersona::State::kPersona:
+      return base::Value(FingerprintPersonaToMcpValue(*stored.persona));
+    case StoredFingerprintPersona::State::kCorrupt:
+      return base::Value(base::DictValue().Set("unreadable", true));
+    case StoredFingerprintPersona::State::kNone:
+      return base::Value();
+  }
+  return base::Value();
+}
+
+void GetFingerprint(const ToolContext& context,
+                    const base::DictValue& args,
+                    ToolCallback callback) {
+  if (!PersonaServiceOf(context)) {
+    std::move(callback).Run(ToolResult::Error(kNoPersonaService));
+    return;
+  }
+  std::move(callback).Run(ToolResult::Json(base::Value(
+      base::DictValue().Set("fingerprint", DescribeFingerprint(context)))));
+}
+
+void SetFingerprint(const ToolContext& context,
+                    const base::DictValue& args,
+                    ToolCallback callback) {
+  ProfilePersonaService* service = PersonaServiceOf(context);
+  if (!service) {
+    std::move(callback).Run(ToolResult::Error(kNoPersonaService));
+    return;
+  }
+  const base::Value* value = args.Find("fingerprint");
+  if (!value) {
+    std::move(callback).Run(ToolResult::Error(MissingArgument("fingerprint")));
+    return;
+  }
+  if (value->is_none()) {
+    service->Clear();
+    std::move(callback).Run(ToolResult::Json(base::Value(
+        base::DictValue().Set("fingerprint", base::Value()))));
+    return;
+  }
+  // Setting keeps the profile's readable persona's seed (a stable identity;
+  // clear it first for a new one) and draws a new one otherwise.
+  StoredFingerprintPersona stored = service->Lookup();
+  if (stored.state == StoredFingerprintPersona::State::kCorrupt &&
+      !(value->is_dict() && value->GetDict().contains("preset"))) {
+    std::move(callback).Run(ToolResult::Error(
+        "fingerprint: the stored fingerprint is unreadable: give a preset to "
+        "replace it, or null to clear it"));
+    return;
+  }
+  const FingerprintPersona* base_persona =
+      stored.state == StoredFingerprintPersona::State::kPersona
+          ? &*stored.persona
+          : nullptr;
+  FingerprintPersona persona;
+  std::string error = ParseFingerprintPersonaInput(
+      *value, base_persona,
+      base_persona ? base_persona->seed : base::RandUint64(), &persona);
+  if (!error.empty()) {
+    std::move(callback).Run(ToolResult::Error("fingerprint: " + error));
+    return;
+  }
+  // The schema only checks the syntax of the time zone; the renderer applies
+  // it as its ICU default time zone and would silently ignore an unknown one.
+  if (!IsKnownTimezoneId(persona.timezone)) {
+    std::move(callback).Run(ToolResult::Error(
+        "fingerprint: timezone is not a known IANA time zone: " +
+        persona.timezone));
+    return;
+  }
+  if (!service->Set(persona)) {
+    std::move(callback).Run(
+        ToolResult::Error("fingerprint: the persona could not be stored"));
+    return;
+  }
+  std::move(callback).Run(ToolResult::Json(base::Value(
+      base::DictValue().Set("fingerprint", DescribeFingerprint(context)))));
+}
+
 // Persistent agents (not throwaway), oldest first, then by id.
 std::vector<std::string> PersistentAgentIds(ProfileRegistry& profiles) {
   std::vector<ProfileRegistry::Entry> entries = profiles.List();
@@ -470,6 +578,10 @@ void CreateAgent(const ToolContext& context,
     std::move(callback).Run(ToolResult::Error(arg_error));
     return;
   }
+  if (args.contains("fingerprint")) {
+    std::move(callback).Run(ToolResult::Error(kFingerprintIsProfileLevel));
+    return;
+  }
   const base::Value* throwaway_arg = args.Find("throwaway");
   if (throwaway_arg && !throwaway_arg->is_bool()) {
     std::move(callback).Run(ToolResult::Error("throwaway must be a boolean"));
@@ -562,6 +674,10 @@ void UpdateAgent(const ToolContext& context,
   std::string error;
   if (!GetBoolArg(args, "avatarData", &avatar_data, &error)) {
     std::move(callback).Run(ToolResult::Error(error));
+    return;
+  }
+  if (args.contains("fingerprint")) {
+    std::move(callback).Run(ToolResult::Error(kFingerprintIsProfileLevel));
     return;
   }
   ProfileRegistry::Identity identity;
@@ -1198,12 +1314,40 @@ constexpr char kTestProxyArgs[] = R"({"type":"object","properties":{
 constexpr char kListAgentsArgs[] = R"({"type":"object","properties":{
   "avatarData":{"type":"boolean","description":"Include uploaded avatar images (large; default: summarized)."}}})";
 
+// A raw string with its own delimiter: the descriptions contain ")" followed
+// by a quote (e.g. "Google Inc. (NVIDIA)"), which would end an R"(...)" one.
+constexpr char kSetFingerprintArgs[] = R"json({"type":"object","properties":{
+  "fingerprint":{"type":["object","null"],"description":"The ONE fingerprint persona of the browser profile, shared by every tab, agent and storage partition (not per agent). null clears it. With preset, a new persona is generated (it keeps the profile's stable identity across presets; clear it first for a new one) and the other fields override it; without preset, the other fields change the current persona. Applied profile-wide to every tab, agent and partition: user agent, client hints, Accept-Language and navigator.language(s), navigator.platform, hardwareConcurrency, deviceMemory, screen size and color depth, devicePixelRatio, and, when given, the WebGL unmasked vendor and renderer. A page keeps what it loaded with until its next navigation or reload; Accept-Language of requests follows at once; the network contexts' own user agent changes at the next browser start. The timezone and locale are applied as the renderer process' ICU defaults, so Date, getTimezoneOffset, toLocale*String and Intl.* follow (open tabs at once; the timezone must be a known IANA id); ICU's defaults are process-global, so this changes every page and dedicated worker of the profile's renderer processes (content does not share a renderer process between profiles; not tested here; with --single-process the two values are not applied at all), not shared/service workers in their own processes, and a DevTools Emulation timezone/locale override still wins while set. Not applied: canvas, audio, fonts, media, form-control locale; WebRTC is only the native IP handling policy of proxied agents/profiles, never spoofed; other workers are not covered.","additionalProperties":false,"properties":{"preset":{"type":"string","enum":["windows-chrome","macos-chrome","linux-chrome"]},"browserVersion":{"type":"string","description":"Chrome's scheme major.0.build.patch, major 100-160, e.g. 158.0.8127.18; the user agent follows."},"locale":{"type":"string","description":"e.g. en-US; languages follows unless given."},"languages":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8,"description":"navigator.languages; the first one is the locale."},"timezone":{"type":"string","description":"IANA id, e.g. Europe/Paris."},"hardwareConcurrency":{"type":"integer","description":"2-64."},"deviceMemory":{"type":"number","enum":[0.25,0.5,1,2,4,8],"description":"GB; a desktop persona needs at least 2 (smaller values are refused), 8 for an Apple Silicon Mac or more than 16 cores."},"screen":{"type":"object","additionalProperties":false,"properties":{"width":{"type":"integer"},"height":{"type":"integer"},"devicePixelRatio":{"type":"number","description":"1-4 in steps of 0.25."},"colorDepth":{"type":"integer","enum":[24,30]}}},"webgl":{"type":["object","null"],"description":"Optional. What getParameter(UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL) returns (WEBGL_debug_renderer_info), nothing else of WebGL (no limits, extensions, GLSL or version strings, rendering output). Chrome/ANGLE-shaped strings that must fit the os (Windows: Direct3D, macOS: Metal, Linux: OpenGL or Vulkan). Not generated by a preset: a preset clears it. null clears it.","additionalProperties":false,"properties":{"vendor":{"type":"string","description":"e.g. Google Inc. (NVIDIA)"},"renderer":{"type":"string","description":"e.g. ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"}}}}}},
+  "required":["fingerprint"]})json";
+
 constexpr Tool kTools[] = {
     {"list-agents",
      "List agents: identity (name, color, avatar), persistSessionCookies, "
      "proxy (redacted; unreadable if it can't be read), open sessions and "
-     "tabs; throwaway agents with idleMinutes and expiresAt.",
+     "tabs; throwaway agents with idleMinutes and expiresAt. The "
+     "fingerprint persona is profile-level, not an agent field: see "
+     "get-fingerprint.",
      kListAgentsArgs, &ListAgents},
+    {"get-fingerprint",
+     "The ONE fingerprint persona of the browser profile, shared by every tab "
+     "and agent: {fingerprint: null | the persona without its seed | "
+     "{unreadable: true}}.",
+     kNoArgs, &GetFingerprint},
+    {"set-fingerprint",
+     "Set (or clear with null) the ONE fingerprint persona of the browser "
+     "profile: the device every tab of every agent presents (user agent, "
+     "client hints, languages, platform, cores, memory, screen, time zone "
+     "and locale). Open tabs' time zone (Date, Intl), locale and renderer "
+     "values follow at once; user agent, client hints and "
+     "navigator.language(s) apply to a page from its next navigation or "
+     "reload; Accept-Language of network requests follows at once. The "
+     "network contexts' own user agent changes only when they are created "
+     "again (browser restart). Time zone/locale are applied per renderer "
+     "process (ICU defaults are process-global; content keeps a profile's "
+     "renderer processes separate, none in --single-process): pages and "
+     "dedicated workers are covered, shared/service workers in their own "
+     "processes are not guaranteed.",
+     kSetFingerprintArgs, &SetFingerprint},
     {"create-agent",
      "Create an agent: an identity shown on its tabs, and its own "
      "cookies, logins and storage, kept across restarts (session cookies "

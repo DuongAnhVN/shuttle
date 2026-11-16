@@ -10,6 +10,7 @@
 #include "chrome/browser/content_settings/host_content_settings_map_factory.h"
 #include "chrome/browser/net/profile_network_context_service.h"
 #include "chrome/browser/profiles/profile.h"
+#include "chrome/browser/shuttle/profile_persona_service_factory.h"
 #include "chrome/browser/shuttle/profile_proxy_service_factory.h"
 #include "chrome/browser/ssl/sct_reporting_service_factory.h"
 #include "chrome/browser/webid/federated_identity_permission_context_factory.h"
@@ -82,6 +83,7 @@ ProfileNetworkContextServiceFactory::ProfileNetworkContextServiceFactory()
   DependsOn(HostContentSettingsMapFactory::GetInstance());
   DependsOn(FederatedIdentityPermissionContextFactory::GetInstance());
   DependsOn(SCTReportingServiceFactory::GetInstance());
+  DependsOn(shuttle::ProfilePersonaServiceFactory::GetInstance());
   DependsOn(shuttle::ProfileProxyServiceFactory::GetInstance());
 
 #if BUILDFLAG(ENABLE_BOUND_SESSION_CREDENTIALS)

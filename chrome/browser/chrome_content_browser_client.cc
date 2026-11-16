@@ -158,6 +158,7 @@
 #include "chrome/browser/service_worker/service_worker_prewarm.h"
 #include "chrome/browser/service_worker/service_worker_synthetic_response.h"
 #include "chrome/browser/shuttle/agent_partition.h"
+#include "chrome/browser/shuttle/persona_tab_prefs.h"
 #include "chrome/browser/shuttle/proxy_auth.h"
 #include "chrome/browser/site_protection/site_familiarity_process_selection_deferring_condition.h"
 #include "chrome/browser/site_protection/site_familiarity_process_selection_user_data.h"
@@ -2825,8 +2826,14 @@ void ChromeContentBrowserClient::UpdateRendererPreferencesForWorker(
   // BrowserContext, not the storage partition or WebContents, so the agent of
   // a shared/service worker cannot be attributed. Such workers get the
   // profile's WebRTC policy. Known gap of the per-agent proxy.
-  renderer_preferences_util::UpdateFromSystemSettings(
-      out_prefs, Profile::FromBrowserContext(browser_context));
+  Profile* profile = Profile::FromBrowserContext(browser_context);
+  renderer_preferences_util::UpdateFromSystemSettings(out_prefs, profile);
+  // The fingerprint persona is profile-wide, so it needs no agent: best
+  // effort for workers (see ApplyProfilePersonaToWorkerPrefs).
+  shuttle::ApplyProfilePersonaToWorkerPrefs(profile, out_prefs);
+  // WebRTC: the profile's own explicit proxy (not an agent's) disables
+  // non-proxied UDP in workers too.
+  shuttle::ApplyProfileWebRtcPolicyToWorkerPrefs(profile, out_prefs);
 }
 
 content::AllowServiceWorkerResult

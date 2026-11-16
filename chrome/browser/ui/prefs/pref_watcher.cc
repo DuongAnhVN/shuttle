@@ -17,6 +17,8 @@
 #include "chrome/browser/profiles/profile_keyed_service_factory.h"
 #include "chrome/browser/profiles/profile_selections.h"
 #include "chrome/browser/renderer_preferences_util.h"
+#include "chrome/browser/shuttle/persona_tab_prefs.h"
+#include "chrome/browser/shuttle/proxy_auth.h"
 #include "chrome/browser/ui/prefs/prefs_tab_helper.h"
 #include "chrome/common/pref_names.h"
 #include "components/keyed_service/core/keyed_service.h"
@@ -210,9 +212,19 @@ void PrefWatcher::UpdateRendererPreferences() {
   for (PrefsTabHelper* helper : tab_helpers_) {
     helper->UpdateRendererPreferences();
   }
+  NotifyRendererPreferenceWatchers();
+}
 
+void PrefWatcher::NotifyRendererPreferenceWatchers() {
   blink::RendererPreferences prefs;
   renderer_preferences_util::UpdateFromSystemSettings(&prefs, profile_);
+  // Shuttle: what ChromeContentBrowserClient::UpdateRendererPreferencesForWorker
+  // sets for a new worker. A watcher's NotifyUpdate replaces the worker's whole
+  // RendererPreferences, so without this a shared or service worker would lose
+  // the profile's fingerprint persona (and WebRTC policy) at the first update
+  // of any renderer preference.
+  shuttle::ApplyProfilePersonaToWorkerPrefs(profile_, &prefs);
+  shuttle::ApplyProfileWebRtcPolicyToWorkerPrefs(profile_, &prefs);
   for (auto& watcher : renderer_preference_watchers_) {
     watcher->NotifyUpdate(prefs);
   }

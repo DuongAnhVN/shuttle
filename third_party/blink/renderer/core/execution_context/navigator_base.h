@@ -34,6 +34,8 @@
 
 namespace blink {
 
+struct RendererPreferences;
+
 // NavigatorBase is a helper for shared logic between Navigator and
 // WorkerNavigator. It is also a Supplementable, and can therefore be used for
 // classes that need to Supplement both Navigator and WorkerNavigator.
@@ -55,6 +57,12 @@ class CORE_EXPORT NavigatorBase : public ScriptWrappable,
   void Trace(Visitor* visitor) const override;
 
   unsigned int hardwareConcurrency() const override;
+  float deviceMemory() const override;
+
+  // Shuttle: the renderer preferences of the page (window) or of the worker
+  // this navigator belongs to, or null if there are none (detached window).
+  // Their *_override fields carry the profile's fingerprint persona.
+  const RendererPreferences* GetRendererPreferencesForPersona() const;
 
  protected:
   ExecutionContext* GetUAExecutionContext() const override;

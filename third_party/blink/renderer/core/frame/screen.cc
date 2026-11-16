@@ -30,12 +30,14 @@
 
 #include "base/numerics/safe_conversions.h"
 #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+#include "third_party/blink/public/common/renderer_preferences/renderer_preferences.h"
 #include "third_party/blink/renderer/core/dom/document.h"
 #include "third_party/blink/renderer/core/event_target_names.h"
 #include "third_party/blink/renderer/core/frame/local_dom_window.h"
 #include "third_party/blink/renderer/core/frame/local_frame.h"
 #include "third_party/blink/renderer/core/frame/settings.h"
 #include "third_party/blink/renderer/core/page/chrome_client.h"
+#include "third_party/blink/renderer/core/page/page.h"
 #include "ui/display/screen_info.h"
 #include "ui/display/screen_infos.h"
 
@@ -109,6 +111,10 @@ unsigned Screen::colorDepth() const {
   if (!DomWindow()) {
     return unknown_color_depth;
   }
+  if (const RendererPreferences* prefs = GetPersonaPreferences();
+      prefs && prefs->screen_color_depth_override > 0) {
+    return static_cast<unsigned>(prefs->screen_color_depth_override);
+  }
   return GetScreenInfo().depth == 0
              ? unknown_color_depth
              : base::saturated_cast<unsigned>(GetScreenInfo().depth);
@@ -173,6 +179,14 @@ gfx::Rect Screen::GetRect(bool available) const {
   if (!DomWindow())
     return gfx::Rect();
   LocalFrame* frame = DomWindow()->GetFrame();
+  if (const RendererPreferences* prefs = GetPersonaPreferences();
+      prefs && prefs->screen_width_override > 0 &&
+      prefs->screen_height_override > 0) {
+    // The profile's persona: its screen size, and no reserved area (taskbar,
+    // dock) so the available area is the screen.
+    return gfx::Rect(0, 0, prefs->screen_width_override,
+                     prefs->screen_height_override);
+  }
   const display::ScreenInfo& screen_info = GetScreenInfo();
   gfx::Rect rect = available ? screen_info.available_rect : screen_info.rect;
   if (frame->GetSettings()->GetReportScreenSizeInPhysicalPixelsQuirk())
@@ -181,6 +195,15 @@ gfx::Rect Screen::GetRect(bool available) const {
     return gfx::ScaleToRoundedRect(rect, screen_info.text_scale_multiplier);
   }
   return rect;
+}
+
+const RendererPreferences* Screen::GetPersonaPreferences() const {
+  if (!DomWindow()) {
+    return nullptr;
+  }
+  LocalFrame* frame = DomWindow()->GetFrame();
+  Page* page = frame ? frame->GetPage() : nullptr;
+  return page ? &page->GetRendererPreferences() : nullptr;
 }
 
 const display::ScreenInfo& Screen::GetScreenInfo() const {

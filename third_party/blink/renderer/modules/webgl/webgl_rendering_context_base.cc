@@ -64,6 +64,7 @@
 #include "media/gfx/paint_canvas_video_renderer.h"
 #include "media/gfx/video_frame_shared_image_cache.h"
 #include "third_party/blink/public/common/features.h"
+#include "third_party/blink/public/common/renderer_preferences/renderer_preferences.h"
 #include "third_party/blink/public/common/thread_safe_browser_interface_broker_proxy.h"
 #include "third_party/blink/public/mojom/gpu/gpu.mojom-blink.h"
 #include "third_party/blink/public/platform/platform.h"
@@ -91,6 +92,7 @@
 #include "third_party/blink/renderer/core/inspector/console_message.h"
 #include "third_party/blink/renderer/core/layout/layout_box.h"
 #include "third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.h"
+#include "third_party/blink/renderer/core/page/page.h"
 #include "third_party/blink/renderer/core/paint/cull_rect_updater.h"
 #include "third_party/blink/renderer/core/paint/paint_layer_painter.h"
 #include "third_party/blink/renderer/core/probe/core_probes.h"
@@ -99,6 +101,7 @@
 #include "third_party/blink/renderer/core/typed_arrays/array_buffer_view_helpers.h"
 #include "third_party/blink/renderer/core/typed_arrays/dom_array_buffer.h"
 #include "third_party/blink/renderer/core/typed_arrays/dom_typed_array.h"
+#include "third_party/blink/renderer/core/workers/worker_or_worklet_global_scope.h"
 #include "third_party/blink/renderer/modules/webcodecs/video_frame.h"
 #include "third_party/blink/renderer/modules/webgl/angle_instanced_arrays.h"
 #include "third_party/blink/renderer/modules/webgl/ext_blend_min_max.h"
@@ -206,6 +209,22 @@ unsigned WebGLRenderingContextBase::max_active_webgl_contexts_ = 0;
 unsigned WebGLRenderingContextBase::max_active_webgl_contexts_on_worker_ = 0;
 
 namespace {
+
+// Shuttle: the renderer preferences of the page (window) or of the worker the
+// context lives in, which carry the profile's fingerprint persona; null if
+// there are none (detached window, other kind of context).
+const RendererPreferences* PersonaRendererPreferences(
+    ExecutionContext* context) {
+  if (auto* window = DynamicTo<LocalDOMWindow>(context)) {
+    LocalFrame* frame = window->GetFrame();
+    Page* page = frame ? frame->GetPage() : nullptr;
+    return page ? &page->GetRendererPreferences() : nullptr;
+  }
+  if (auto* worker_scope = DynamicTo<WorkerOrWorkletGlobalScope>(context)) {
+    return &worker_scope->GetRendererPreferences();
+  }
+  return nullptr;
+}
 
 enum class WebGLANGLEImplementation {
   // These values are persisted to logs. Entries should not be renumbered and
@@ -4295,6 +4314,16 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
       return ScriptValue::CreateNull(script_state->GetIsolate());
     case WebGLDebugRendererInfo::kUnmaskedRendererWebgl:
       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
+        // Shuttle: the persona's UNMASKED_RENDERER_WEBGL, only when both its
+        // vendor and renderer are set (they are stored together).
+        if (const RendererPreferences* prefs = PersonaRendererPreferences(
+                ExecutionContext::From(script_state));
+            prefs && !prefs->webgl_unmasked_vendor_override.empty() &&
+            !prefs->webgl_unmasked_renderer_override.empty()) {
+          return WebGLAny(
+              script_state,
+              String::FromUtf8(prefs->webgl_unmasked_renderer_override));
+        }
         return WebGLAny(script_state,
                         String(ContextGL()->GetString(GL_RENDERER)));
       }
@@ -4304,6 +4333,15 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
       return ScriptValue::CreateNull(script_state->GetIsolate());
     case WebGLDebugRendererInfo::kUnmaskedVendorWebgl:
       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
+        // Shuttle: the persona's UNMASKED_VENDOR_WEBGL (see above).
+        if (const RendererPreferences* prefs = PersonaRendererPreferences(
+                ExecutionContext::From(script_state));
+            prefs && !prefs->webgl_unmasked_vendor_override.empty() &&
+            !prefs->webgl_unmasked_renderer_override.empty()) {
+          return WebGLAny(
+              script_state,
+              String::FromUtf8(prefs->webgl_unmasked_vendor_override));
+        }
         return WebGLAny(script_state,
                         String(ContextGL()->GetString(GL_VENDOR)));
       }

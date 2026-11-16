@@ -1964,6 +1964,12 @@ double LocalDOMWindow::devicePixelRatio() const {
     return 0.0;
   }
 
+  // Shuttle: the profile's persona reports its own ratio to scripts. Layout and
+  // painting keep using the real one (LocalFrame::DevicePixelRatio()).
+  if (Page* page = GetFrame()->GetPage();
+      page && page->GetRendererPreferences().device_pixel_ratio_override > 0) {
+    return page->GetRendererPreferences().device_pixel_ratio_override;
+  }
   return GetFrame()->DevicePixelRatio();
 }
 

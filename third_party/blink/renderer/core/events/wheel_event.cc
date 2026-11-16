@@ -41,6 +41,12 @@ namespace blink {
 
 namespace {
 
+// The real ratio of the frame, not window.devicePixelRatio(): that one reports
+// a persona's ratio to scripts, which must not scale wheel deltas.
+double RealDevicePixelRatio(LocalDOMWindow& window) {
+  return window.GetFrame() ? window.GetFrame()->DevicePixelRatio() : 0.0;
+}
+
 unsigned ConvertDeltaMode(const WebMouseWheelEvent& event) {
   // WebMouseWheelEvent only supports these units for the delta.
   DCHECK(event.delta_units == ui::ScrollGranularity::kScrollByPage ||
@@ -104,10 +110,10 @@ WheelEvent::WheelEvent(const WebMouseWheelEvent& event, LocalDOMWindow& window)
                  GetMouseEventInitForWheel(event, window),
                  event.TimeStamp()),
       wheel_delta_(
-          (event.wheel_ticks_x * kTickMultiplier) / window.devicePixelRatio(),
-          (event.wheel_ticks_y * kTickMultiplier) / window.devicePixelRatio()),
-      delta_x_(-event.DeltaXInRootFrame() / window.devicePixelRatio()),
-      delta_y_(-event.DeltaYInRootFrame() / window.devicePixelRatio()),
+          (event.wheel_ticks_x * kTickMultiplier) / RealDevicePixelRatio(window),
+          (event.wheel_ticks_y * kTickMultiplier) / RealDevicePixelRatio(window)),
+      delta_x_(-event.DeltaXInRootFrame() / RealDevicePixelRatio(window)),
+      delta_y_(-event.DeltaYInRootFrame() / RealDevicePixelRatio(window)),
       delta_z_(0),
       delta_mode_(ConvertDeltaMode(event)),
       native_event_(event),

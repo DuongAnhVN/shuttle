@@ -100,6 +100,25 @@ struct BLINK_COMMON_EXPORT RendererPreferences {
   bool is_global_privacy_control_setting_enabled{false};
   std::optional<bool> global_privacy_control_devtools_override;
 
+  // Shuttle: values of the profile's fingerprint persona (see
+  // renderer_preferences.mojom). Empty/0 means stock behavior.
+  std::string navigator_platform_override;
+  uint32_t hardware_concurrency_override{0};
+  float device_memory_override{0};
+  int32_t screen_width_override{0};
+  int32_t screen_height_override{0};
+  int32_t screen_color_depth_override{0};
+  float device_pixel_ratio_override{0};
+  // WebGL getParameter(UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL) values.
+  // Both set or both empty (empty: the real GPU strings).
+  std::string webgl_unmasked_vendor_override;
+  std::string webgl_unmasked_renderer_override;
+  // IANA time zone id and BCP 47 locale of the persona; empty = host/stock.
+  std::string timezone_override;
+  std::string locale_override;
+  // True: GPU.requestAdapter() resolves null (WebGPU blocked for the persona).
+  bool webgpu_blocked{false};
+
   ui::KeyboardCode autofill_shortcut_key_code = ui::VKEY_UNKNOWN;
   int autofill_shortcut_modifiers = 0;
   bool autofill_at_memory_double_ctrl_trigger_enabled = false;

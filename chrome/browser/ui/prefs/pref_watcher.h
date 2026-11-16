@@ -34,6 +34,12 @@ class PrefWatcher : public KeyedService,
   void RegisterRendererPreferenceWatcher(
       mojo::PendingRemote<blink::mojom::RendererPreferenceWatcher> watcher);
 
+  // Shuttle: sends the profile's current preferences (including its
+  // fingerprint persona) to the registered watchers only, i.e. the profile's
+  // shared and service workers. For changes that tab code already applies to
+  // the tabs itself (the persona, the profile's proxy preference).
+  void NotifyRendererPreferenceWatchers();
+
  private:
   // KeyedService overrides:
   void Shutdown() override;

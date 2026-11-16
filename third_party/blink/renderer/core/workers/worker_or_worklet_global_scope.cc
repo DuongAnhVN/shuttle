@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "base/metrics/histogram_functions.h"
+#include "base/no_destructor.h"
 #include "base/task/single_thread_task_runner.h"
 #include "base/threading/thread_checker.h"
 #include "services/network/public/mojom/web_sandbox_flags.mojom-blink.h"
@@ -653,6 +654,13 @@ String WorkerOrWorkletGlobalScope::GetAcceptLanguages() const {
 
 const RendererPreferences& WorkerOrWorkletGlobalScope::GetRendererPreferences()
     const {
+  // Shuttle: the fingerprint persona readers (NavigatorBase, WebGL) call this
+  // for any worker scope; a scope without a fetch context (some worklets,
+  // tests) reports the default preferences, i.e. no persona override.
+  if (!web_worker_fetch_context_) {
+    static const base::NoDestructor<RendererPreferences> kDefaultPreferences;
+    return *kDefaultPreferences;
+  }
   return web_worker_fetch_context_->GetRendererPreferences();
 }
 

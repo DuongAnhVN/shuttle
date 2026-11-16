@@ -374,9 +374,10 @@ class CORE_EXPORT Page final : public GarbageCollected<Page>,
   const RendererPreferences& GetRendererPreferences() const {
     return renderer_preferences_;
   }
-  void SetRendererPreferences(const RendererPreferences& prefs) {
-    renderer_preferences_ = prefs;
-  }
+  // Shuttle: also applies the persona's time zone / locale
+  // (timezone_override, locale_override) to the renderer process when they
+  // changed.
+  void SetRendererPreferences(const RendererPreferences& prefs);
 
   void SetDefaultPageScaleLimits(float min_scale, float max_scale);
   void SetUserAgentPageScaleConstraints(
@@ -547,6 +548,10 @@ class CORE_EXPORT Page final : public GarbageCollected<Page>,
   }
 
  private:
+  // Shuttle: see SetRendererPreferences.
+  // |page_is_going_away|: this page's own values are ignored (WillBeDestroyed).
+  void ApplyPersonaIntlOverrides(bool page_is_going_away);
+
   friend class TextFragmentAnchorTestBase;
   friend class TextFragmentAnchorTest;
   friend class TextFragmentAnchorMetricsTest;
