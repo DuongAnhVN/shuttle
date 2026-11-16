@@ -13,7 +13,6 @@
 #include <vector>
 
 #include "base/check.h"
-#include "base/containers/contains.h"
 #include "base/strings/strcat.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/string_split.h"
@@ -99,6 +98,12 @@ constexpr size_t kMaxWebglStringLength = 200;
 // "version" is shared between the top level and "browser".
 
 constexpr std::array<double, 6> kDeviceMemories = {0.25, 0.5, 1, 2, 4, 8};
+
+// base::Contains was removed from this Chromium; the standard ranges do it.
+template <typename Range, typename Value>
+bool Contains(const Range& range, const Value& value) {
+  return std::ranges::find(range, value) != std::ranges::end(range);
+}
 
 // splitmix64: the next 64 random bits after `state`, advancing it.
 uint64_t NextRandom(uint64_t& state) {
@@ -269,7 +274,7 @@ bool IsLocale(std::string_view locale) {
       return false;
     }
   }
-  if (!base::Contains(kKnownLanguages, language)) {
+  if (!Contains(kKnownLanguages, language)) {
     return false;
   }
   if (dash == std::string_view::npos) {
@@ -674,7 +679,7 @@ bool ReadNumber(const base::DictValue& dict,
 bool OnlyKeys(const base::DictValue& dict,
               std::initializer_list<std::string_view> allowed) {
   for (auto [key, value] : dict) {
-    if (!base::Contains(allowed, std::string_view(key))) {
+    if (!Contains(allowed, std::string_view(key))) {
       return false;
     }
   }
@@ -685,7 +690,7 @@ bool OnlyKeys(const base::DictValue& dict,
 std::string UnknownKey(const base::DictValue& dict,
                        std::initializer_list<std::string_view> allowed) {
   for (auto [key, value] : dict) {
-    if (!base::Contains(allowed, std::string_view(key))) {
+    if (!Contains(allowed, std::string_view(key))) {
       return key;
     }
   }
@@ -952,7 +957,7 @@ std::string CheckFingerprintPersona(const FingerprintPersona& persona) {
   if (persona.hardware_concurrency < 2 || persona.hardware_concurrency > 64) {
     return "hardwareConcurrency must be an integer from 2 to 64";
   }
-  if (!base::Contains(kDeviceMemories, persona.device_memory)) {
+  if (!Contains(kDeviceMemories, persona.device_memory)) {
     return "deviceMemory must be 0.25, 0.5, 1, 2, 4 or 8";
   }
   // Desktop machines only (hints.mobile is false).
@@ -1268,7 +1273,7 @@ std::string ParseFingerprintPersonaInput(const base::Value& value,
   }
   if (const base::Value* memory = dict->Find("deviceMemory")) {
     std::optional<double> gb = GetFiniteNumber(*memory);
-    if (!gb || !base::Contains(kDeviceMemories, *gb)) {
+    if (!gb || !Contains(kDeviceMemories, *gb)) {
       return "deviceMemory must be 0.25, 0.5, 1, 2, 4 or 8";
     }
     persona.device_memory = *gb;
