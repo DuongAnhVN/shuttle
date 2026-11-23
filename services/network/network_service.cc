@@ -336,6 +336,121 @@ class RestrictedCookieManagerMetrics
 
 }  // namespace
 
+// Lives and binds on NetworkService's owning sequence, as do ordinary context
+// ReceiverSets. No callbacks, IPC waits or task dispatch occur inside Release's
+// validation/bind batch. Mojo dispatch begins only after this task yields.
+class StorageHandoffTransaction final : public mojom::StorageHandoffTransaction {
+ public:
+  StorageHandoffTransaction(
+      mojo::PendingReceiver<mojom::StorageHandoffTransaction> receiver,
+      std::vector<mojom::StorageHandoffMemberPtr> expected)
+      : receiver_(this, std::move(receiver)) {
+    for (auto& member : expected) {
+      if (member->attempt.is_empty() || !member->generation ||
+          members_.contains(member->attempt)) {
+        invalid_ = true;
+        continue;
+      }
+      auto attempt = member->attempt;
+      members_.emplace(attempt, Member{std::move(member), {}, {}});
+    }
+  }
+
+  bool Prepare(const mojom::StorageHandoffMember& identity,
+               NetworkContext* context,
+               mojo::PendingReceiver<mojom::NetworkContext> workload) {
+    auto it = members_.find(identity.attempt);
+    if (invalid_ || released_ || it == members_.end() ||
+        it->second.identity->generation != identity.generation ||
+        it->second.workload.is_valid() || !workload.is_valid()) {
+      invalid_ = true;
+      return false;
+    }
+    it->second.context = context->GetStorageHandoffWeakPtr();
+    it->second.workload = std::move(workload);
+    return true;
+  }
+
+  void SetDisconnectHandler(base::OnceClosure callback) {
+    receiver_.set_disconnect_handler(std::move(callback));
+  }
+
+  void Release(ReleaseCallback callback) override {
+    if (released_) {
+      std::move(callback).Run(mojom::StorageHandoffReleaseResult::kReleased);
+      return;
+    }
+    if (invalid_) {
+      std::move(callback).Run(mojom::StorageHandoffReleaseResult::kRejected);
+      return;
+    }
+    for (const auto& [attempt, member] : members_) {
+      if (!member.context || !member.workload.is_valid() ||
+          !member.context->CanReleaseStorageHandoff(*member.identity)) {
+        invalid_ = true;
+        std::move(callback).Run(mojom::StorageHandoffReleaseResult::kRejected);
+        return;
+      }
+    }
+    // Irreversible common linearization point. Do not add hooks/callbacks here.
+    released_ = true;
+    auto bound_count = std::make_shared<size_t>(0);
+    for (auto& [attempt, member] : members_)
+      member.context->BindStorageHandoffWorkload(std::move(member.workload),
+                                                bound_count);
+    // Fault injection is deliberately AFTER the entire non-reentrant batch.
+    if (hold_reply_for_testing_) {
+      held_reply_for_testing_ = std::move(callback);
+      return;
+    }
+    std::move(callback).Run(mojom::StorageHandoffReleaseResult::kReleased);
+  }
+
+  void HoldReleaseReplyForTesting() override { hold_reply_for_testing_ = true; }
+  void DropReleaseReplyForTesting() override {
+    held_reply_for_testing_.Reset();
+    receiver_.ResetWithReason(0, "Injected lost Release reply");
+  }
+
+ private:
+  struct Member {
+    mojom::StorageHandoffMemberPtr identity;
+    base::WeakPtr<NetworkContext> context;
+    mojo::PendingReceiver<mojom::NetworkContext> workload;
+  };
+  mojo::Receiver<mojom::StorageHandoffTransaction> receiver_;
+  std::map<base::UnguessableToken, Member> members_;
+  bool invalid_ = false;
+  bool released_ = false;
+  bool hold_reply_for_testing_ = false;
+  ReleaseCallback held_reply_for_testing_;
+};
+
+void NetworkService::BeginStorageHandoff(
+    mojo::PendingReceiver<mojom::StorageHandoffTransaction> receiver,
+    std::vector<mojom::StorageHandoffMemberPtr> expected,
+    BeginStorageHandoffCallback callback) {
+  auto token = base::UnguessableToken::Create();
+  auto transaction = std::make_unique<StorageHandoffTransaction>(
+      std::move(receiver), std::move(expected));
+  transaction->SetDisconnectHandler(base::BindOnce(
+      [](base::WeakPtr<NetworkService> self, base::UnguessableToken token) {
+        if (self) self->handoff_transactions_.erase(token);
+      }, weak_factory_.GetWeakPtr(), token));
+  handoff_transactions_.emplace(token, std::move(transaction));
+  std::move(callback).Run(handoff_service_instance_, token);
+}
+
+bool NetworkService::PrepareStorageHandoff(
+    const base::UnguessableToken& transaction,
+    const mojom::StorageHandoffMember& member, NetworkContext* context,
+    mojo::PendingReceiver<mojom::NetworkContext> workload) {
+  auto it = handoff_transactions_.find(transaction);
+  return it != handoff_transactions_.end() &&
+      context->network_service() == this &&
+      it->second->Prepare(member, context, std::move(workload));
+}
+
 // Handler of delaying calls to NetworkContext::ActivateDohProbes() until after
 // an initial service startup delay.
 class NetworkService::DelayedDohProbeActivator {

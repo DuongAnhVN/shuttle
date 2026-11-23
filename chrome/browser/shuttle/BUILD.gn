@@ -5,17 +5,25 @@
 # The in-browser MCP server (agent profiles, sessions, tabs). Design:
 # tools/shuttle/docs/MCP.md.
 
+import("//testing/test.gni")
+
 assert(!is_android)
 
 source_set("shuttle") {
   public = [
     "home_tab.h",
+    "scoped_routing.h",
     "shuttle_service.h",
     "shuttle_service_factory.h",
   ]
 
   public_deps = [
+    ":browser_admin_auth",
+    ":browser_owner_index",
+    ":browser_profile_registry",
+    ":browser_profile_router",
     ":network_access",
+    ":scope_auth",
     "//base",
     "//chrome/browser/profiles:profile",
     "//components/keyed_service/core",
@@ -45,6 +53,20 @@ source_set("network_access") {
 # Names of the Shuttle prefs (header only), shared by the targets below.
 source_set("pref_names") {
   sources = [ "pref_names.h" ]
+}
+
+source_set("managed_network_admission") {
+  sources = [
+    "managed_network_admission.cc",
+    "managed_network_admission.h",
+  ]
+  public_deps = [
+    "//base",
+    "//components/os_crypt/async/common",
+  ]
+  deps = [
+    "//content/public/browser",
+  ]
 }
 
 # Agent partition helpers the network stack calls (session-cookie
@@ -82,6 +104,7 @@ source_set("agent_proxy") {
     "//net",
   ]
   deps = [
+    ":managed_network_admission",
     ":agent_partition",
     ":pref_names",
     "//chrome/browser/profiles:profile",
@@ -136,6 +159,8 @@ source_set("agent_persona") {
     "//third_party/blink/public/common",
   ]
   deps = [
+    ":managed_network_admission",
+    ":agent_proxy",  # FailClosedNetConfig: managed profile without a persona.
     ":pref_names",
     "//chrome/browser/profiles:profile",
     "//components/embedder_support:user_agent",
@@ -210,6 +235,125 @@ source_set("agent_proxy_auth") {
   ]
 }
 
+# --- Isolated Chromium Profiles (lane B1) --------------------------------------
+# Contract: tools/shuttle/docs/PROFILES.md. Opt-in (--shuttle-isolated-profiles).
+# NOT YET COMPILED: written on a machine without a Chromium build; see
+# "Implementation status" in that document.
+
+# Persistent registry of managed Profiles (ShuttleBrowserProfiles.json), the
+# state machine and request-id idempotency. Plain data: no Profile, no content.
+source_set("browser_profile_registry") {
+  sources = [
+    "browser_profile_registry.cc",
+    "browser_profile_registry.h",
+  ]
+  public_deps = [ "//base" ]
+  deps = [ "//crypto" ]
+}
+
+# Browser-wide session/target ownership indexes (locators, never authority).
+source_set("browser_owner_index") {
+  sources = [
+    "browser_owner_index.cc",
+    "browser_owner_index.h",
+  ]
+  public_deps = [ "//base" ]
+}
+
+# The browser administration credential (ShuttleManagerAdminToken).
+source_set("browser_admin_auth") {
+  sources = [
+    "browser_admin_auth.cc",
+    "browser_admin_auth.h",
+  ]
+  public_deps = [ "//base" ]
+  deps = [ "//crypto" ]
+}
+
+# Managed-profile bootstrap, called by ProfileImpl::OnPrefsLoaded before bulk
+# services (early extension preference services are allowed). Depends on prefs,
+# os_crypt and the persona/proxy data
+# layers only; never on the router (it reaches it through
+# ManagedProfileProvider) nor on ShuttleService.
+source_set("managed_profile_bootstrap") {
+  sources = [
+    "managed_profile_bootstrap.cc",
+    "managed_profile_bootstrap.h",
+  ]
+  public_deps = [
+    ":managed_network_admission",
+    ":browser_profile_registry",
+    "//base",
+  ]
+  deps = [
+    ":agent_persona",
+    ":agent_proxy",
+    ":fingerprint_persona",
+    ":pref_names",
+    "//chrome/browser:browser_process",
+    "//chrome/browser/profiles:profile",
+    "//components/os_crypt/async/browser",
+    "//components/os_crypt/async/common",
+    "//components/prefs",
+    "//crypto",
+  ]
+}
+
+# --- Scoped routing and CDP authorization (lane B2) ------------------------------
+# Pure logic: the `_meta["shuttle/profileId"]` selector parser, the CDP
+# connection decision table and the per-session bearer grants. No Profile, no
+# content: unit tested alone.
+source_set("scope_auth") {
+  sources = [
+    "scope_auth.cc",
+    "scope_auth.h",
+  ]
+  public_deps = [
+    ":browser_owner_index",
+    "//base",
+  ]
+  deps = [
+    ":browser_profile_registry",
+    "//crypto",
+  ]
+}
+
+# The browser-level router: startup Profile capture, Resolve(), create/list/
+# load/stop/delete of managed Profiles through ProfileManager, get-capabilities.
+source_set("browser_profile_router") {
+  sources = [
+    "browser_profile_router.cc",
+    "browser_profile_router.h",
+  ]
+  public_deps = [
+    ":browser_owner_index",
+    ":browser_profile_registry",
+    ":managed_profile_bootstrap",
+    ":managed_network_admission",
+    "//base",
+    "//chrome/browser/profiles:profile",
+    "//mojo/public/cpp/bindings",
+    "//services/network/public/mojom",
+  ]
+  deps = [
+    ":agent_persona",
+    ":agent_proxy",
+    ":browser_admin_auth",
+    ":fingerprint_persona",
+    ":switches",
+    "//chrome/browser:browser_process",
+    "//chrome/browser/profiles",
+    "//chrome/browser/profiles:profile_manager",
+    "//chrome/browser/profiles/keep_alive",
+    "//chrome/common:constants",
+    "//components/os_crypt/async/browser",
+    "//components/os_crypt/async/common",
+    "//components/prefs",
+    "//content/public/browser",
+    "//crypto",
+  ]
+}
+
 source_set("impl") {
   sources = [
     "agent_browser_sidecar.cc",
@@ -230,6 +374,7 @@ source_set("impl") {
     "proxy_check.h",
     "proxy_tab_sync.cc",
     "proxy_tab_sync.h",
+    "scoped_routing.cc",
     "session_cdp_filter.cc",
     "session_cdp_filter.h",
     "session_manager.cc",
@@ -243,8 +388,14 @@ source_set("impl") {
     ":agent_persona",
     ":agent_proxy",
     ":agent_proxy_auth",
+    ":browser_admin_auth",
+    ":browser_owner_index",
+    ":browser_profile_registry",
+    ":browser_profile_router",
     ":fingerprint_persona",
+    ":managed_profile_bootstrap",
     ":pref_names",
+    ":scope_auth",
     ":shuttle",
     ":switches",
     "//base",
@@ -289,4 +440,75 @@ source_set("impl") {
     "//ui/gfx/geometry",
     "//url",
   ]
+}
+
+# --- Native tests of the isolated Chromium Profiles (NOT YET COMPILED) --------
+# This tree has no desktop unit_tests / browser_tests aggregate, so the unit
+# tests get a small standalone runner. The browser test is a source_set that
+# can join a browser_tests executable once the pruned Chrome test harness is
+# restored. //chrome/test:shuttle_profile_tests currently builds ONLY unit tests;
+# it does NOT compile or execute browser_profile_lifecycle_browsertest.cc.
+
+source_set("unit_tests") {
+  testonly = true
+  sources = [
+    "browser_profile_registry_unittest.cc",
+    "scope_auth_unittest.cc",
+  ]
+  deps = [
+    ":browser_admin_auth",
+    ":browser_owner_index",
+    ":browser_profile_registry",
+    ":scope_auth",
+    "//base",
+    "//base/test:test_support",
+    "//testing/gtest",
+  ]
+}
+
+test("shuttle_profile_unittests") {
+  deps = [
+    ":unit_tests",
+    "//base/test:run_all_unittests",
+  ]
+}
+
+declare_args() {
+  # The browser test needs //chrome/test:test_support, which this pruned tree
+  # cannot load (empty test_proto and missing Chrome test support/runner sources).
+  # This flag exposes source-only tests, NOT a runnable browser-test executable.
+  shuttle_build_browser_tests = false
+}
+
+if (shuttle_build_browser_tests) {
+source_set("browser_tests") {
+  testonly = true
+  sources = [ "browser_profile_lifecycle_browsertest.cc" ]
+  deps = [
+    ":agent_proxy",
+    ":managed_network_admission",
+    ":agent_persona",
+    ":browser_profile_router",
+    ":fingerprint_persona",
+    ":managed_profile_bootstrap",
+    ":pref_names",
+    ":switches",
+    "//base",
+    "//base/test:test_support",
+    "//chrome/browser:browser_process",
+    "//chrome/browser/profiles:profile",
+    "//chrome/browser/profiles:profile_manager",
+    "//chrome/common:constants",
+    "//chrome/test:test_support",
+    "//components/keyed_service/content",
+    "//components/prefs",
+    "//content/test:test_support",
+    "//content/public/browser",
+    "//net:test_support",
+    "//net/traffic_annotation:test_support",
+    "//services/network/public/cpp",
+    "//services/network/public/mojom",
+    "//testing/gtest",
+  ]
+}
 }

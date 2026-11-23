@@ -13,7 +13,11 @@
 #include "build/chromeos_buildflags.h"
 #include "chrome/browser/accessibility/accessibility_labels_service_factory.h"
 #include "chrome/browser/controlled_frame/controlled_frame_media_permission_cache_factory.h"
+#include "base/files/file_path.h"
+#include "base/path_service.h"
+#include "chrome/browser/shuttle/browser_profile_router.h"
 #include "chrome/browser/shuttle/profile_persona_service_factory.h"
+#include "chrome/common/chrome_paths.h"
 #include "chrome/browser/shuttle/profile_proxy_service_factory.h"
 #include "chrome/browser/shuttle/shuttle_service_factory.h"
 #include "chrome/browser/accessibility/page_colors_controller_factory.h"
@@ -835,4 +839,29 @@ void ChromeBrowserMainExtraPartsProfiles::PreProfileInit() {
   EnsureBrowserContextKeyedServiceFactoriesBuilt();
   shuttle::ProfileProxyServiceFactory::GetInstance()->set_os_crypt_async(
       g_browser_process->os_crypt_async());
+
+  // Shuttle: isolated profiles (opt-in, --shuttle-isolated-profiles). The
+  // router must exist before the first Profile is created: the managed-profile
+  // bootstrap in ProfileImpl::OnPrefsLoaded consults it. Returns null (and
+  // does nothing) without the switch.
+  base::FilePath user_data_dir;
+  if (base::PathService::Get(chrome::DIR_USER_DATA, &user_data_dir)) {
+    shuttle::BrowserProfileRouter::Initialize(user_data_dir);
+  }
+}
+
+void ChromeBrowserMainExtraPartsProfiles::PostProfileInit(
+    Profile* profile,
+    bool is_initial_profile) {
+  if (!is_initial_profile) {
+    return;
+  }
+  if (shuttle::BrowserProfileRouter* router =
+          shuttle::BrowserProfileRouter::Get()) {
+    router->CaptureStartupProfile(profile);
+  }
+}
+
+void ChromeBrowserMainExtraPartsProfiles::PostMainMessageLoopRun() {
+  shuttle::BrowserProfileRouter::Shutdown();
 }

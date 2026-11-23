@@ -84,6 +84,10 @@ class ProfileProxyService : public KeyedService {
   // calls it each time, so a service built before the browser had os_crypt
   // gets its encryptor on the next GetForProfile.
   void InitEncryption(os_crypt_async::OSCryptAsync* os_crypt_async);
+  // Bootstrap hands off the exact validated encryptor synchronously, before
+  // any partition can ask for proxy auth/configuration.
+  void AdoptBootstrapEncryptor(
+      scoped_refptr<os_crypt_async::Encryptor> encryptor);
 
   void AddObserver(Observer* observer);
   void RemoveObserver(Observer* observer);

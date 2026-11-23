@@ -27,6 +27,9 @@
 #include "chrome/browser/lifetime/application_lifetime.h"
 #include "chrome/browser/policy/developer_tools_policy_handler.h"
 #include "chrome/browser/policy/profile_policy_connector.h"
+#include "chrome/browser/shuttle/browser_admin_auth.h"
+#include "chrome/browser/shuttle/browser_profile_router.h"
+#include "chrome/browser/shuttle/scoped_routing.h"
 #include "chrome/browser/shuttle/shuttle_service.h"
 #include "chrome/browser/profiles/keep_alive/profile_keep_alive_types.h"
 #include "chrome/browser/profiles/profile.h"
@@ -183,6 +186,12 @@ ChromeDevToolsManagerDelegate::ChromeDevToolsManagerDelegate() {
     }
   }
 #endif  // !BUILDFLAG(IS_CHROMEOS)
+
+  // Isolated profiles (--shuttle-isolated-profiles): the router is created
+  // earlier (ChromeBrowserMainExtraPartsProfiles); the drain delegate and the
+  // scoped-routing announcement belong to this chain (no-op with the switch
+  // off, or when the router does not exist yet: then it stays "not ready").
+  shuttle::InstallScopedRouting();
 }
 
 ChromeDevToolsManagerDelegate::~ChromeDevToolsManagerDelegate() {
@@ -250,29 +259,46 @@ void ChromeDevToolsManagerDelegate::Activate(
   devtools_window->ActivateWindow();
 }
 
+bool ChromeDevToolsManagerDelegate::VerifyAdminToken(
+    std::string_view presented) {
+  // False unless --shuttle-isolated-profiles established the credential.
+  return shuttle::VerifyBrowserAdminToken(presented);
+}
+
+bool ChromeDevToolsManagerDelegate::AllowBrowserGlobalHttp(
+    const RequestContext& context) {
+  // With isolated profiles on, browser-global discovery (/json/*) is an admin
+  // operation; otherwise unchanged.
+  return !shuttle::BrowserProfileRouter::Get() || context.admin;
+}
+
 void ChromeDevToolsManagerDelegate::HandleMcpRequest(
     const std::string& host,
     const std::string& body,
+    const RequestContext& context,
     HttpResponseCallback callback) {
-  // The MCP server starts once the profile is loaded (GetLastUsedProfile()
-  // would block on it).
-  Profile* profile = ProfileManager::GetLastUsedProfileIfLoaded();
-  shuttle::ShuttleService* service =
-      profile ? shuttle::ShuttleService::Get(
-                    profile->GetOriginalProfile())
-              : nullptr;
-  if (!service) {
-    std::move(callback).Run(503, "text/plain",
-                            "Shuttle is still starting up.");
-    return;
-  }
-  service->HandleMcpRequest(host, body, std::move(callback));
+  // Isolated profiles on: the router resolves the Profile (the fixed startup
+  // Profile, or the one `_meta["shuttle/profileId"]` names for an admin);
+  // GetLastUsedProfileIfLoaded() is never consulted. Off: the MCP server
+  // starts once the profile is loaded (GetLastUsedProfile() would block on
+  // it), exactly as before.
+  Profile* legacy_profile = shuttle::BrowserProfileRouter::Get()
+                                ? nullptr
+                                : ProfileManager::GetLastUsedProfileIfLoaded();
+  shuttle::ShuttleService::HandleHttpMcpRequest(
+      legacy_profile, host, body, context.admin, std::move(callback));
 }
 
 std::unique_ptr<content::DevToolsManagerDelegate::ConnectionFilter>
 ChromeDevToolsManagerDelegate::CreateConnectionFilter(
     const std::string& session_id,
-    const std::string& target_id) {
+    const std::string& target_id,
+    const RequestContext& context) {
+  if (shuttle::BrowserProfileRouter::Get()) {
+    // Isolated profiles on: DecideConnection() is the only way in, and it
+    // never uses the last-used Profile.
+    return nullptr;
+  }
   Profile* profile = ProfileManager::GetLastUsedProfileIfLoaded();
   shuttle::ShuttleService* service =
       profile ? shuttle::ShuttleService::Get(
@@ -280,6 +306,19 @@ ChromeDevToolsManagerDelegate::CreateConnectionFilter(
               : nullptr;
   return service ? service->CreateConnectionFilter(session_id, target_id)
                  : nullptr;
+}
+
+content::DevToolsManagerDelegate::ConnectionDecision
+ChromeDevToolsManagerDelegate::DecideConnection(ConnectionKind kind,
+                                                const std::string& session_id,
+                                                const std::string& target_id,
+                                                const RequestContext& context) {
+  if (!shuttle::BrowserProfileRouter::Get()) {
+    // Legacy: the default decision (explicit, see DevToolsManagerDelegate).
+    return content::DevToolsManagerDelegate::DecideConnection(
+        kind, session_id, target_id, context);
+  }
+  return shuttle::DecideScopedConnection(kind, session_id, target_id, context);
 }
 
 void ChromeDevToolsManagerDelegate::HandleCommand(
@@ -424,7 +463,12 @@ scoped_refptr<DevToolsAgentHost> ChromeDevToolsManagerDelegate::CreateNewTarget(
     const GURL& url,
     DevToolsManagerDelegate::TargetType target_type,
     bool new_window) {
-  Profile* profile = ProfileManager::GetLastUsedProfile();
+  shuttle::BrowserProfileRouter* router = shuttle::BrowserProfileRouter::Get();
+  // Isolated profiles on (admin only, see DecideConnection / /json/new): the
+  // fixed startup Profile, never the last-used one.
+  Profile* profile =
+      router ? router->ResolveStartupProfile()
+             : ProfileManager::GetLastUsedProfile();
   if (!profile) {
     // The last used profile can't be loaded.
     return nullptr;
@@ -448,12 +492,28 @@ ChromeDevToolsManagerDelegate::GetBrowserContexts() {
 
 content::BrowserContext*
 ChromeDevToolsManagerDelegate::GetDefaultBrowserContext() {
+  if (shuttle::BrowserProfileRouter* router =
+          shuttle::BrowserProfileRouter::Get()) {
+    // Isolated profiles on: the default context of the (admin) browser socket
+    // is the fixed startup Profile, never the last-used one.
+    return router->ResolveStartupProfile();
+  }
   return DevToolsBrowserContextManager::GetInstance()
       .GetDefaultBrowserContext();
 }
 
 content::BrowserContext* ChromeDevToolsManagerDelegate::GetBrowserContext(
     const std::string& context_id) {
+  if (shuttle::BrowserProfileRouter* router =
+          shuttle::BrowserProfileRouter::Get()) {
+    // Isolated profiles on: a browserContextId names the fixed startup
+    // Profile or nothing here, never the last-used one. A managed Profile's
+    // id does not resolve (no cross-profile reach through the content
+    // handlers; commands that need it are answered by the scoped filter).
+    Profile* startup = router->ResolveStartupProfile();
+    Profile* original = startup ? startup->GetOriginalProfile() : nullptr;
+    return original && original->UniqueId() == context_id ? original : nullptr;
+  }
   return DevToolsBrowserContextManager::GetInstance().GetProfileById(
       context_id);
 }

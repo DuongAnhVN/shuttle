@@ -275,6 +275,7 @@ class ServiceWorkerContext;
 class SiteInstance;
 class SpeechRecognitionManagerDelegate;
 class StoragePartition;
+class NetworkContextHandoffProof;
 class TracingDelegate;
 class TtsPlatform;
 class URLLoaderRequestInterceptor;
@@ -2210,8 +2211,26 @@ class CONTENT_EXPORT ContentBrowserClient {
   //
   // If |relative_partition_path| is the empty string, it means this needs to
   // create the default NetworkContext for the BrowserContext.
+  // May retain `admitted` until identity prefs/credentials are ready. Content
+  // has bound a pipe but has NOT configured or constructed the NetworkContext.
+  // Dropping the closure denies creation and closes the receiver. The closure
+  // is weak-bound to the StoragePartition, and must run on the UI sequence.
+  virtual void AwaitNetworkContextAdmission(BrowserContext* context,
+                                            base::OnceClosure admitted);
+
   virtual void ConfigureNetworkContextParams(
       BrowserContext* context,
+      bool in_memory,
+      const base::FilePath& relative_partition_path,
+      network::mojom::NetworkContextParams* network_context_params,
+      cert_verifier::mojom::CertVerifierCreationParams*
+          cert_verifier_creation_params);
+
+  // Explicit browser-only staging authority; default denies construction.
+  virtual bool ConfigureNetworkContextParamsForHandoff(
+      BrowserContext* context,
+      StoragePartition* participant,
+      const NetworkContextHandoffProof& proof,
       bool in_memory,
       const base::FilePath& relative_partition_path,
       network::mojom::NetworkContextParams* network_context_params,

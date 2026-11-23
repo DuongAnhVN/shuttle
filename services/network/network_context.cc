@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "services/network/network_context.h"
+#include "services/network/public/mojom/network_context.mojom-shared-message-ids.h"
 
 #include <algorithm>
 #include <memory>
@@ -85,6 +86,7 @@
 #include "net/cookies/cookie_monster.h"
 #include "net/cookies/cookie_setting_override.h"
 #include "net/cookies/cookie_store.h"
+#include "net/cookies/cookie_util.h"
 #include "net/cookies/site_for_cookies.h"
 #include "net/device_bound_sessions/session_service.h"
 #include "net/disk_cache/buildflags.h"
@@ -742,14 +744,9 @@ NetworkContext::NetworkContext(
       variations_headers_(std::move(params_->initial_variations_headers)) {
   TRACE_EVENT0("loading", "NetworkContext::NetworkContext");
 
-  if (features::ShouldBindNetworkContextDirectReceiver()) {
+  if (!params_->handoff_member && features::ShouldBindNetworkContextDirectReceiver()) {
     receiver_.emplace<DirectReceiver>(mojo::DirectReceiverKey{}, this);
   }
-  std::visit(
-      [&](auto& receiver_to_bind) {
-        receiver_to_bind.Bind(std::move(receiver));
-      },
-      receiver_);
 #if BUILDFLAG(IS_WIN) && DCHECK_IS_ON()
   if (params_->file_paths) {
     DCHECK(params_->win_permissions_set)
@@ -831,17 +828,6 @@ NetworkContext::NetworkContext(
 
   network_service_->RegisterNetworkContext(this);
 
-  // Only register for destruction if |this| will be wholly lifetime-managed
-  // by the NetworkService. In the other constructors, lifetime is shared with
-  // other consumers, and thus self-deletion is not safe and can result in
-  // double-frees.
-  std::visit(
-      [&](auto& receiver) {
-        receiver.set_disconnect_handler(base::BindOnce(
-            &NetworkContext::OnConnectionError, base::Unretained(this)));
-      },
-      receiver_);
-
   socket_factory_ = std::make_unique<SocketFactory>(
       url_request_context_->net_log(), url_request_context_);
 #if BUILDFLAG(IS_WIN)
@@ -921,6 +907,61 @@ NetworkContext::NetworkContext(
   } else {
     initial_filters_loaded_ = true;
   }
+
+  // Keep incoming factory/context calls queued until cookie handoff completes.
+  // This also preserves cookies for in-memory partitions and opt-out session
+  // cookies, which a disk flush alone cannot preserve.
+  auto initial_cookies = std::move(params_->initial_cookies);
+  if (params_->handoff_member) {
+    auto pipe = receiver.PassPipe();
+    auto handle = pipe.get();
+    restoring_handoff_receiver_ =
+        mojo::PendingReceiver<mojom::NetworkContext>(std::move(pipe));
+    restoring_handoff_watcher_ = std::make_unique<mojo::SimpleWatcher>(
+        FROM_HERE, mojo::SimpleWatcher::ArmingPolicy::MANUAL);
+    restoring_handoff_watcher_->Watch(handle, MOJO_HANDLE_SIGNAL_PEER_CLOSED,
+        base::BindRepeating([](base::WeakPtr<NetworkContext> self, MojoResult) {
+          if (self) self->OnConnectionError();
+        }, weak_factory_.GetWeakPtr()));
+    restoring_handoff_watcher_->ArmOrNotify();
+  }
+  RestoreCookies(initial_cookies, base::BindOnce(
+      [](base::WeakPtr<NetworkContext> self,
+         mojo::PendingReceiver<mojom::NetworkContext> receiver, bool success) {
+        if (!self) {
+          return;
+        }
+        if (!success) {
+          base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+              FROM_HERE, base::BindOnce(&NetworkContext::OnConnectionError, self));
+          return;
+        }
+        if (self->params_->handoff_member) {
+          self->restoring_handoff_watcher_.reset();
+          receiver = std::move(self->restoring_handoff_receiver_);
+        }
+        std::visit([&](auto& target) {
+          target.Bind(std::move(receiver));
+          target.set_disconnect_handler(base::BindOnce(
+              &NetworkContext::OnConnectionError, self));
+        }, self->receiver_);
+        if (self->params_->handoff_member) {
+          // A staged context's primary pipe is private control, not a second
+          // workload entry point. Keep this allowlist deliberately minimal.
+          class ControlFilter final : public mojo::MessageFilter {
+           public:
+            bool WillDispatch(mojo::Message* message) override {
+              using Method = mojom::messages::NetworkContext;
+              return message->name() == static_cast<uint32_t>(Method::kAcknowledgeStorageHandoff) ||
+                  message->name() == static_cast<uint32_t>(Method::kPrepareStorageHandoff) ||
+                  message->name() == static_cast<uint32_t>(Method::kRetire);
+            }
+            void DidDispatchOrReject(mojo::Message*, bool) override {}
+          };
+          std::get<Receiver>(self->receiver_).SetFilter(
+              std::make_unique<ControlFilter>());
+        }
+      }, weak_factory_.GetWeakPtr(), std::move(receiver)));
 }
 
 NetworkContext::NetworkContext(
@@ -1137,6 +1178,9 @@ void NetworkContext::CreateSocketFactory(
 void NetworkContext::CreateURLLoaderFactory(
     mojo::PendingReceiver<mojom::URLLoaderFactory> receiver,
     mojom::URLLoaderFactoryParamsPtr params) {
+  if (retiring_) {
+    return;
+  }
   scoped_refptr<ResourceSchedulerClient> resource_scheduler_client =
       base::MakeRefCounted<ResourceSchedulerClient>(
           ResourceScheduler::ClientId::Create(),
@@ -1160,6 +1204,102 @@ void NetworkContext::ResetURLLoaderFactories() {
   for (auto* factory : factories) {
     factory->ClearBindings();
   }
+}
+
+void NetworkContext::Retire(
+    mojo::PendingReceiver<mojom::NetworkContext> completion,
+    RetireCallback callback) {
+  // Not valid for externally-owned URLRequestContexts used by some embedders.
+  CHECK(on_connection_close_callback_);
+  CHECK(!retiring_);
+  retiring_ = true;
+  restricted_cookie_managers_.clear();
+  // Unlike ResetURLLoaderFactories this includes ignore-reset factories and
+  // destroys their in-flight loaders before taking the final cookie snapshot.
+  auto factories = std::move(url_loader_factories_);
+  factories.clear();
+  cloned_receivers_.Clear();
+  cookie_manager_->SetForceKeepSessionState();
+  cookie_manager_->GetAllCookies(base::BindOnce(
+      [](base::WeakPtr<NetworkContext> self,
+         mojo::PendingReceiver<mojom::NetworkContext> completion,
+         RetireCallback callback,
+         const std::vector<net::CanonicalCookie>& cookies) {
+        if (!self) {
+          return;
+        }
+        self->cookie_manager_->FlushCookieStore(base::BindOnce(
+            [](base::WeakPtr<NetworkContext> self,
+               mojo::PendingReceiver<mojom::NetworkContext> completion,
+               RetireCallback callback,
+               std::vector<net::CanonicalCookie> cookies) {
+              if (!self) {
+                return;
+              }
+              // The separate completion receiver lives across destruction,
+              // unlike the primary receiver (destroyed partway through it).
+              auto destroy = std::move(self->on_connection_close_callback_);
+              std::move(callback).Run(cookies);
+              std::move(destroy).Run(self.get());
+              completion.reset();
+            }, self, std::move(completion), std::move(callback), cookies));
+      }, weak_factory_.GetWeakPtr(), std::move(completion), std::move(callback)));
+}
+
+void NetworkContext::RestoreCookies(
+    const std::optional<std::vector<net::CanonicalCookie>>& cookies,
+    base::OnceCallback<void(bool)> callback) {
+  if (!cookies) {
+    std::move(callback).Run(true);
+    return;
+  }
+  // NetworkContext's owned request context uses CookieMonster (see
+  // MakeURLRequestContext). No lossy Set-Cookie round trip is involved.
+  static_cast<net::CookieMonster*>(url_request_context_->cookie_store())
+      ->RestoreStorageSnapshotAsync(*cookies, std::move(callback));
+}
+
+void NetworkContext::AcknowledgeStorageHandoff(
+    AcknowledgeStorageHandoffCallback callback) {
+  std::move(callback).Run();
+}
+
+void NetworkContext::GetStorageHandoffBoundCountForTesting(
+    GetStorageHandoffBoundCountForTestingCallback callback) {
+  std::move(callback).Run(handoff_bound_count_ ? *handoff_bound_count_ : 0);
+}
+
+void NetworkContext::PrepareStorageHandoff(
+    const base::UnguessableToken& transaction,
+    mojom::StorageHandoffMemberPtr member,
+    mojo::PendingReceiver<mojom::NetworkContext> workload,
+    PrepareStorageHandoffCallback callback) {
+  const bool prepared = !handoff_workload_prepared_ && network_service_ && member &&
+      CanReleaseStorageHandoff(*member) &&
+      network_service_->PrepareStorageHandoff(transaction, *member, this,
+                                             std::move(workload));
+  handoff_workload_prepared_ |= prepared;
+  std::move(callback).Run(prepared);
+}
+
+bool NetworkContext::CanReleaseStorageHandoff(
+    const mojom::StorageHandoffMember& member) const {
+  return !retiring_ && !handoff_workload_released_ && params_->handoff_member &&
+      params_->handoff_member->attempt == member.attempt &&
+      params_->handoff_member->generation == member.generation;
+}
+
+base::WeakPtr<NetworkContext> NetworkContext::GetStorageHandoffWeakPtr() {
+  return weak_factory_.GetWeakPtr();
+}
+
+void NetworkContext::BindStorageHandoffWorkload(
+    mojo::PendingReceiver<mojom::NetworkContext> workload,
+    std::shared_ptr<size_t> bound_count) {
+  handoff_bound_count_ = std::move(bound_count);
+  handoff_workload_released_ = true;
+  cloned_receivers_.Add(this, std::move(workload));
+  ++*handoff_bound_count_;
 }
 
 void NetworkContext::GetViaObliviousHttp(
@@ -1359,7 +1499,7 @@ void NetworkContext::DisableQuic() {
 
 void NetworkContext::DestroyURLLoaderFactory(
     PrefetchMatchingURLLoaderFactory* url_loader_factory) {
-  if (is_destructing_) {
+  if (is_destructing_ || retiring_) {
     return;
   }
   auto it = url_loader_factories_.find(url_loader_factory);
@@ -3517,6 +3657,9 @@ void NetworkContext::OnHttpCacheSizeComputed(
 void NetworkContext::OnConnectionError() {
   // If owned by the network service, this call will delete |this|.
   if (on_connection_close_callback_) {
+    // Keep the browser's lifetime fence alive across the entire destructor,
+    // including factories/clones that outlive the primary receiver member.
+    auto lifetime = std::move(params_->handoff_lifetime);
     std::move(on_connection_close_callback_).Run(this);
   }
 }

@@ -43,6 +43,7 @@
 #include "base/test/test_future.h"
 #include "base/threading/thread.h"
 #include "base/time/time.h"
+#include "base/unguessable_token.h"
 #include "cookie_partition_key.h"
 #include "net/base/features.h"
 #include "net/cookies/canonical_cookie.h"
@@ -1153,6 +1154,28 @@ class TestPrefDelegate : public CookieMonster::PrefDelegate {
   base::DictValue test_dict;
 };
 
+TEST_F(DeferredCookieTaskTest, TrustedHandoffWaitsForDiskAndSupersedesLateKey) {
+  DeclareLoadedCookie(http_www_foo_.url(),
+      "disk=old; path=/" + FutureCookieExpirationString(), Time::Now());
+  // Start both a priority load and full Load before the handoff global task.
+  GetCookieListCallback read;
+  cookie_monster_->GetCookieListWithOptionsAsync(
+      http_www_foo_.url(), CookieOptions::MakeAllInclusive(),
+      CookiePartitionKeyCollection(), read.MakeCallback());
+  base::test::TestFuture<bool> restored;
+  cookie_monster_->RestoreStorageSnapshotAsync({}, restored.GetCallback());
+  base::RunLoop().RunUntilIdle();
+  EXPECT_FALSE(restored.IsReady());
+  ExecuteLoads(CookieStoreCommand::LOAD);
+  EXPECT_TRUE(restored.Get());
+  EXPECT_TRUE(GetAllCookies(cookie_monster_.get()).empty());
+  // A late priority reply contains pre-handoff data. It cannot resurrect it.
+  DeclareLoadedCookie(http_www_foo_.url(),
+      "disk=stale; path=/" + FutureCookieExpirationString(), Time::Now());
+  ExecuteLoads(CookieStoreCommand::LOAD_COOKIES_FOR_KEY);
+  EXPECT_TRUE(GetAllCookies(cookie_monster_.get()).empty());
+}
+
 TEST_F(DeferredCookieTaskTest, DeferredGetCookieList) {
   DeclareLoadedCookie(http_www_foo_.url(),
                       "X=1; path=/" + FutureCookieExpirationString(),
@@ -1563,6 +1586,60 @@ TEST_F(DeferredCookieTaskTest,
 // both unpartitioned and partitioned cookies for that key while preserving
 // other keys), and falls back to the global queue (`DoCookieCallback`) for
 // non-canonical subdomains or multi-domain filters.
+TEST_F(CookieMonsterTest, TrustedStorageHandoffPreservesCanonicalOverlap) {
+  auto source = std::make_unique<CookieMonster>(nullptr, NetLog::Get());
+  auto destination = std::make_unique<CookieMonster>(nullptr, NetLog::Get());
+  const GURL https("https://handoff.test/sub/page");
+  const Time now = Time::Now();
+  ASSERT_TRUE(SetCookieWithCreationTime(source.get(), https,
+      "A=persistent; Secure; Path=/; Max-Age=86400; Priority=High", now));
+  // This is valid when originally written over HTTPS, despite overlapping the
+  // Secure cookie. Replaying it with a synthetic HTTP source rejects it.
+  ASSERT_TRUE(SetCookieWithCreationTime(source.get(), https,
+      "A=session; Path=/sub; SameSite=Lax", now));
+  const auto partition = CookiePartitionKey::FromURLForTesting(
+      GURL("https://top.test"));
+  ASSERT_TRUE(SetCookieWithCreationTime(source.get(), https,
+      "A=chips; Secure; Partitioned; Path=/", now, partition));
+  const auto nonce_partition = CookiePartitionKey::FromURLForTesting(
+      GURL("https://top.test"), CookiePartitionKey::AncestorChainBit::kSameSite,
+      base::UnguessableToken::Create());
+  ASSERT_TRUE(SetCookieWithCreationTime(source.get(), https,
+      "A=nonce; Secure; Partitioned; Path=/", now, nonce_partition));
+  const CookieList snapshot = GetAllCookies(source.get());
+  ASSERT_EQ(4u, snapshot.size());
+  // Pre-existing entries in BOTH destination maps must be reconciled away.
+  ASSERT_TRUE(SetCookieWithCreationTime(destination.get(), https,
+      "stale=1; Secure; Partitioned; Path=/", now, partition));
+  ASSERT_TRUE(SetCookieWithCreationTime(destination.get(), https,
+      "stale=2; Path=/", now));
+  for (int retry = 0; retry != 2; ++retry) {
+    base::test::TestFuture<bool> restored;
+    destination->RestoreStorageSnapshotAsync(snapshot, restored.GetCallback());
+    ASSERT_TRUE(restored.Get());
+    CookieList actual = GetAllCookies(destination.get());
+    ASSERT_EQ(snapshot.size(), actual.size());
+    for (const auto& expected : snapshot) {
+      const auto found = std::ranges::find_if(actual, [&](const auto& cookie) {
+        return cookie.IsEquivalent(expected);
+      });
+      ASSERT_NE(actual.end(), found);
+      EXPECT_TRUE(found->HasEquivalentDataMembers(expected));
+    }
+  }
+  // Reject the whole malformed/duplicate payload, not a partial restore.
+  CookieList duplicate = snapshot;
+  duplicate.push_back(snapshot.front());
+  base::test::TestFuture<bool> invalid;
+  destination->RestoreStorageSnapshotAsync(duplicate, invalid.GetCallback());
+  EXPECT_FALSE(invalid.Get());
+  EXPECT_EQ(snapshot.size(), GetAllCookies(destination.get()).size());
+  base::test::TestFuture<bool> empty;
+  destination->RestoreStorageSnapshotAsync({}, empty.GetCallback());
+  EXPECT_TRUE(empty.Get());
+  EXPECT_TRUE(GetAllCookies(destination.get()).empty());
+}
+
 TEST_F(CookieMonsterTest, DeleteAllMatchingInfoPerKeyFastPathAndFallback) {
   base::test::ScopedFeatureList scoped_feature_list(
       features::kCookieMonsterPerKeyDelete);

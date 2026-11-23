@@ -238,6 +238,54 @@ at the next browser start (page requests carry the new one already).
 - `create-agent` / `update-agent` **refuse** a `fingerprint` argument with an error naming `set-fingerprint`; the earlier
   per-agent form never shipped and is not kept. A persona stored per agent by that draft is ignored and removed.
 
+## Isolated Chromium Profiles (`--shuttle-isolated-profiles`, lane B2, not yet compiled)
+
+Opt-in and off by default. Contract: `PROFILES.md` (frozen; this section only says how the core implements it). Without
+the flag nothing below applies: MCP, CDP, the 10-hex session ids and the unauthenticated loopback `/json/*` are as
+before. With it:
+
+- **Admin token.** The browser writes a random 256-bit token to `<user-data-dir>/ShuttleManagerAdminToken` (owner-only).
+  A caller presents it as the HTTP header `X-Shuttle-Admin-Token` (MCP POST, `/json/*`, WebSocket upgrade). It is checked
+  even on loopback, in constant time, and read from **headers only**: never from the URL or `_meta`. The network access
+  token (`?token=`) is not an admin credential. Anything else a caller says about its role is ignored.
+- **Browser-level tools** (no `_meta` selector allowed, unknown arguments rejected): `get-capabilities` (public),
+  `create-browser-profile`, `list-browser-profiles`, `load-browser-profile`, `stop-browser-profile`,
+  `delete-browser-profile` (admin only; absent from a non-admin `tools/list`; a non-admin call is `forbidden`).
+  `get-capabilities` returns `{capabilitiesVersion, isolatedProfiles:{supported,enabled}, scopedRouting,
+  profileScopeMetadata:"shuttle/profileId", bindingVersion, browserEpoch}`; `scopedRouting` is true only after the
+  scoped CDP/drain delegates are installed.
+- **Scope selector.** `params._meta["shuttle/profileId"] = "bp_<32 hex>"` on any other tool call, parsed before any session
+  is touched. Needs admin (`forbidden` otherwise, a selector grants nothing). Malformed (including a non-object `_meta`,
+  `null`, a non-string) is `invalid_profile_key`; unknown `profile_not_found`; not ready `profile_not_ready`. No selector:
+  the startup Profile captured at startup, never the last-used one. Selector on a browser-level tool: `invalid_profile_key`.
+- **Errors.** `isError:true` with `structuredContent.error:{code,message}`; codes as in `PROFILES.md` section 3. Bad
+  arguments of the browser tools use `profile_failed` with the fixed message "Unexpected or malformed arguments."; messages
+  never contain paths, seeds or tokens.
+- **Sessions.** With a router the session id is a browser-wide UUIDv4 (collision-checked in the shared index); the owner
+  `{profile, workspace agent, lifecycle epoch, browser epoch}` is recorded and re-derived on every CDP connect. Tab and
+  session tools require the tab/session to belong to the Profile the call is scoped to. `open-session` of a Profile that
+  is draining answers `profile_not_ready`.
+- **Scoped CDP.** The `cdpEndpoint` and each tab `cdpUrl` carry a per-session bearer grant (`?grant=<256-bit>`), random,
+  bound to the owner tuple, never the admin token, revoked on `close-session`, idle close, stop or restart. Decisions
+  (`ConnectionDecision`): browser socket and browser-global `/json/*` → admin or 403; session socket → unknown or stale
+  owner 404, no/forged grant 403, otherwise a **mandatory** scoped filter (admin gets the same filter); page socket → the
+  tab's grant or admin. The scoped filter re-checks authorization on every message and closes on revoke; it exposes only
+  its own targets (including popups, workers and flattened child sessions), no foreign BrowserContext, no
+  `Target.create/disposeBrowserContext`, no browser-level `Storage.*` except the agent's own cookies, no window-bounds,
+  command-line or histogram commands, and permission/download commands only with its own `browserContextId`.
+- **Persona.** `set-fingerprint` with a selector (admin) is the only tool that addresses a `stopped` Profile: it does not
+  load it, it calls `BrowserProfileRouter::ReplacePersona`, which validates the persona (a FULL persona: `preset`
+  required, known time zone; `persona_invalid` otherwise, arguments are exactly `{fingerprint}`), persists the new intent,
+  a pending flag and the incremented lifecycle epoch in one registry write, and answers `{fingerprint: <summary, no
+  seed>}`. The bootstrap commits it (new seed) at the next load; a Profile still in memory is committed at once. Ready,
+  loading, initializing, draining: `profile_busy`; failed: `profile_not_ready`. Clearing is `persona_invalid`. Cookies and
+  storage are never touched. Every other tool on a stopped Profile stays `profile_not_ready`.
+- **Discovery page.** `/` is gated like `/json/*` (admin or 403) when isolated profiles are on.
+- **Drain / stop.** Closes admission, revokes grants, closes sessions and connections, stops the throwaway timer, flushes
+  cookies, then polls every 100 ms for up to 2 min until no handle is left; a timeout leaves it `draining` (`drain_timeout`).
+- Probes (opt-in, `smoke-all.sh --with profiles`): `smoke-browser-profiles`, `smoke-profile-routing`, `smoke-profile-cdp`,
+  `smoke-profile-network`, `smoke-profile-cookies`. Written, never run.
+
 ## Open
 
 - `outerWidth/outerHeight` report the window, not the resized tab viewport (detectable mismatch).

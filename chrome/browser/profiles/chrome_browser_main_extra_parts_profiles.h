@@ -27,6 +27,11 @@ class ChromeBrowserMainExtraPartsProfiles : public ChromeBrowserMainExtraParts {
 
   // Overridden from ChromeBrowserMainExtraParts:
   void PreProfileInit() override;
+  // Shuttle: captures the fixed startup Profile for the isolated-profile
+  // router (a no-op unless --shuttle-isolated-profiles is set).
+  void PostProfileInit(Profile* profile, bool is_initial_profile) override;
+  // Shuttle: destroys the isolated-profile router while Profiles are alive.
+  void PostMainMessageLoopRun() override;
 };
 
 #endif  // CHROME_BROWSER_PROFILES_CHROME_BROWSER_MAIN_EXTRA_PARTS_PROFILES_H_

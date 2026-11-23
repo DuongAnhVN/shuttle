@@ -1233,3 +1233,39 @@ Linux `gn gen` + build is the open item.
   agent attribution parses the partition path (`Storage/ext/shuttle-<id>/def`), so an upstream layout change makes agents
   lose their proxy silently (smoke-proxy catches it); on headless Linux without a keyring `os_crypt` uses a fixed key, so
   the stored password is obfuscated, not secret.
+
+
+## Fork commit 63 (2026-11-17): isolated Chromium Profiles, core lane B1
+
+Nothing removed. New: managed, isolated Chromium Profiles with their own persona (plan "Chromium Profile độc lập và
+persona riêng"; contract `PROFILES.md`, design and limits in `FEATURES.md` row 63). Branch `sh/native-chromium-fingerprint`.
+**Uncommitted and not yet compiled**: written on a host that cannot build Chromium; the first Linux `gn gen` + build is the
+open item. Lane B1 only: the CDP/MCP side (`devtools_http_handler.cc`, session ids, `_meta`, tool dispatch) is lane B2.
+- New in `chrome/browser/shuttle/`: `browser_profile_registry.{h,cc}` (manifest, state machine, tombstones, idempotent
+  `requestId`, one durable write in flight with rollback), `browser_owner_index.{h,cc}`, `browser_admin_auth.{h,cc}`,
+  `managed_profile_bootstrap.{h,cc}`, `browser_profile_router.{h,cc}`, plus `browser_profile_registry_unittest.cc` and
+  `browser_profile_lifecycle_browsertest.cc`.
+- Upstream touch points: `profiles/profile_impl.{h,cc}` (hook in `OnPrefsLoaded`; the old remainder moved verbatim to
+  `OnManagedProfileBootstrapped`), `profiles/chrome_browser_main_extra_parts_profiles.{h,cc}` (router init, startup
+  profile capture, shutdown), two `profiles/BUILD.gn` deps, `chrome/test/BUILD.gn` (`shuttle_profile_tests` group).
+- `ProfilePersonaService` fails closed for managed profiles (missing persona is corrupt, `Clear()` refused, no persona
+  means a fail-closed proxy config).
+- Feature is off unless `--shuttle-isolated-profiles` is passed and the manifest and admin token are usable.
+
+
+## Fork commit 64 (2026-11-17): isolated Chromium Profiles, core lane B2
+
+Nothing removed. New: routing, authorization and ownership of the isolated Profiles (plan "Chromium Profile độc lập và
+persona riêng"; contract `PROFILES.md`, usage `MCP.md`, design in `FEATURES.md` row 64). Branch
+`sh/native-chromium-fingerprint`. **Uncommitted and not yet compiled** (no build host); needs lane B1's files.
+- Upstream touch points: `content/browser/devtools/devtools_http_handler.cc`, `content/public/browser/devtools_manager_delegate.{h,cc}`
+  (new virtuals with legacy-preserving defaults, `RequestContext`, `ConnectionDecision`),
+  `chrome/browser/devtools/chrome_devtools_manager_delegate.{h,cc}`.
+- New in `chrome/browser/shuttle/`: `scope_auth.{h,cc}`, `scoped_routing.{h,cc}`, `scope_auth_unittest.cc`; changed:
+  `shuttle_service`, `session_manager`, `session_cdp_filter`, `mcp_tools`, `page_tools`, `BUILD.gn`.
+- Behaviour with the flag ON that differs from before: raw browser WebSocket and `/json/*` need the admin token; session
+  ids are UUIDv4; endpoints carry `?grant=`; the default Profile for CDP/MCP is the startup one, never last-used.
+  With the flag OFF everything is as in commit 63.
+- Probes: `smoke-browser-profiles`, `smoke-profile-routing`, `smoke-profile-cdp`, `smoke-profile-network`,
+  `smoke-profile-cookies` (opt-in: `smoke-all.sh --with profiles`; written, never run); `lib/smoke.mjs` gained `cdp(url,
+  headers)`, `httpStatus`, `wsStatus`; `lib/profiles.mjs` is new.

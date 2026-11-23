@@ -1067,6 +1067,10 @@ void CookieMonster::OnKeyLoaded(
     std::vector<std::unique_ptr<CanonicalCookie>> cookies) {
   DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
 
+  // A full Load completion supersedes outstanding priority loads. In
+  // particular a late key reply must not resurrect pre-handoff disk state.
+  if (finished_fetching_all_cookies_)
+    return;
   StoreLoadedCookies(std::move(cookies));
 
   auto tasks_pending_for_key = tasks_pending_for_key_.find(key);
@@ -1894,6 +1898,53 @@ void CookieMonster::SetCanonicalCookie(
 
   // TODO(chlily): Log metrics.
   MaybeRunCookieCallback(std::move(callback), access_result);
+}
+
+void CookieMonster::RestoreStorageSnapshotAsync(
+    CookieList snapshot, base::OnceCallback<void(bool)> callback) {
+  DoCookieCallback(base::BindOnce(&CookieMonster::RestoreStorageSnapshot,
+                                 base::Unretained(this), std::move(snapshot),
+                                 std::move(callback)));
+}
+
+void CookieMonster::RestoreStorageSnapshot(
+    CookieList snapshot, base::OnceCallback<void(bool)> callback) {
+  DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
+  // Validate the entire native payload before touching memory or disk. Use
+  // storage canonicality: older, still-valid stored cookies need not satisfy
+  // newer web creation policy. UniqueKey includes partition/source scope.
+  std::set<UniqueCookieKey> keys;
+  for (const auto& cookie : snapshot) {
+    if (!cookie.IsCanonicalForFromStorage() ||
+        ContainsControlCharacter(cookie.Name()) ||
+        ContainsControlCharacter(cookie.Value()) ||
+        !keys.insert(cookie.UniqueKey()).second) {
+      std::move(callback).Run(false);
+      return;
+    }
+  }
+  // Reconcile the persistent store as well as both memory maps. Deletions and
+  // additions are ordered on PersistentCookieStore's sequence; FlushStore below
+  // drains those operations before acknowledging restoration.
+  while (!cookies_.empty())
+    InternalDeleteCookie(cookies_.begin(), true, DELETE_COOKIE_EXPLICIT);
+  while (!partitioned_cookies_.empty()) {
+    auto partition = partitioned_cookies_.begin();
+    InternalDeletePartitionedCookie(partition, partition->second->begin(), true,
+                                    DELETE_COOKIE_EXPLICIT);
+  }
+  earliest_access_time_ = base::Time();
+  for (const auto& cookie : snapshot) {
+    CookieAccessResult access;
+    access.access_semantics = CookieAccessSemantics::UNKNOWN;
+    InternalInsertCookie(GetKey(cookie.Domain()),
+                         std::make_unique<CanonicalCookie>(cookie), true,
+                         access, /*dispatch_change=*/false);
+    if (earliest_access_time_.is_null() ||
+        cookie.LastAccessDate() < earliest_access_time_)
+      earliest_access_time_ = cookie.LastAccessDate();
+  }
+  FlushStore(base::BindOnce(std::move(callback), true));
 }
 
 void CookieMonster::SetAllCookies(CookieList list,

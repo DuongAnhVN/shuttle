@@ -180,8 +180,14 @@ class ProfileImpl : public Profile {
   // Does final initialization. Should be called after prefs were loaded.
   void DoFinalInit(CreateMode create_mode);
 
-  // Switch locale (when possible) and proceed to OnLocaleReady().
+  // Runs the managed-profile bootstrap (managed_profile_bootstrap.h, a no-op
+  // for unmanaged profiles) and then OnManagedProfileBootstrapped().
   void OnPrefsLoaded(CreateMode create_mode, bool success);
+
+  // The bootstrap finished; `success` false = fail closed, the
+  // profile creation is reported as failed. Switches locale (when possible)
+  // and proceeds to OnLocaleReady(), which creates the keyed services.
+  void OnManagedProfileBootstrapped(CreateMode create_mode, bool success);
 
   // Does final prefs initialization and calls Init().
   void OnLocaleReady(CreateMode create_mode);

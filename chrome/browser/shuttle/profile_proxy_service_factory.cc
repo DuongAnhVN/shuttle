@@ -5,11 +5,20 @@
 #include "chrome/browser/shuttle/profile_proxy_service_factory.h"
 
 #include <memory>
+#include "base/check.h"
 
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/shuttle/profile_proxy_service.h"
+#include "chrome/browser/shuttle/managed_network_admission.h"
+#include "components/os_crypt/async/common/encryptor.h"
 
 namespace shuttle {
+
+ProfileProxyService* ProfileProxyServiceFactory::GetForProfileIfExists(
+    Profile* profile) {
+  return profile ? static_cast<ProfileProxyService*>(
+      GetInstance()->GetServiceForBrowserContext(profile, false)) : nullptr;
+}
 
 // static
 ProfileProxyService* ProfileProxyServiceFactory::GetForProfile(
@@ -48,8 +57,11 @@ void ProfileProxyServiceFactory::set_os_crypt_async(
 std::unique_ptr<KeyedService>
 ProfileProxyServiceFactory::BuildServiceInstanceForBrowserContext(
     content::BrowserContext* context) const {
-  return std::make_unique<ProfileProxyService>(
+  CHECK(ManagedNetworkAdmissionReady(context));
+  auto service = std::make_unique<ProfileProxyService>(
       Profile::FromBrowserContext(context), os_crypt_async_.get());
+  service->AdoptBootstrapEncryptor(ManagedNetworkEncryptor(context));
+  return service;
 }
 
 // Created with the profile: the network stack asks for it while it configures

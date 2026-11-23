@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "base/containers/span.h"
 #include "base/functional/callback.h"
@@ -188,15 +189,46 @@ class CONTENT_EXPORT DevToolsManagerDelegate {
   // The embedder can use this information to update the UI.
   virtual void SetActiveWebSocketConnections(size_t count);
 
+  // Shuttle: what the HTTP layer authenticated about one request. Built by
+  // DevToolsHttpHandler from the request headers (never from a body field or
+  // a caller-supplied role) and passed down through the delegate interface.
+  struct CONTENT_EXPORT RequestContext {
+    RequestContext();
+    RequestContext(const RequestContext& other);
+    RequestContext& operator=(const RequestContext& other);
+    ~RequestContext();
+
+    // The request presented the browser admin credential
+    // (X-Shuttle-Admin-Token) and VerifyAdminToken() accepted it. Never taken
+    // from the URL.
+    bool admin = false;
+    // The per-session bearer grant presented by a scoped endpoint (the
+    // `grant` query parameter or X-Shuttle-Session-Grant), or "". Verified by
+    // the embedder against the session it names; it is not the admin token.
+    std::string session_grant;
+  };
+
+  // Shuttle: whether `presented` is the browser admin credential. The HTTP
+  // layer calls it once per request with the X-Shuttle-Admin-Token value.
+  // The default implementation accepts nothing.
+  virtual bool VerifyAdminToken(std::string_view presented);
+
+  // Shuttle: whether browser-global HTTP endpoints (/json/*, the discovery
+  // page) are open to the request. The default implementation allows them.
+  virtual bool AllowBrowserGlobalHttp(const RequestContext& context);
+
   // Shuttle: handles an HTTP request to /mcp on the remote debugging
   // server (the in-browser MCP server). `host` is the request's Host header
-  // (for building CDP URLs), `body` the POSTed JSON-RPC message. `callback`
-  // receives the HTTP status, the content type and the body; it may run
-  // asynchronously. The default implementation answers 404.
+  // (for building CDP URLs), `body` the POSTed JSON-RPC message. `context` is
+  // the authenticated request context: the embedder must authorize the
+  // request (profile selector, admin-only tools) before touching a session.
+  // `callback` receives the HTTP status, the content type and the body; it
+  // may run asynchronously. The default implementation answers 404.
   using HttpResponseCallback = base::OnceCallback<
       void(int status, std::string content_type, std::string body)>;
   virtual void HandleMcpRequest(const std::string& host,
                                 const std::string& body,
+                                const RequestContext& context,
                                 HttpResponseCallback callback);
 
   // Shuttle: filters the protocol messages of one remote debugging
@@ -209,6 +241,11 @@ class CONTENT_EXPORT DevToolsManagerDelegate {
     // the connection's DevTools agent host, `to_client` to the WebSocket.
     // Both are safe to call after the connection is gone (no-ops).
     virtual void Start(SendCallback to_agent, SendCallback to_client) = 0;
+    // Called right after Start(): `close` closes the WebSocket connection
+    // (safe after the connection is gone). A filter calls it when its
+    // authority is revoked (session closed, Profile stopped). The default
+    // implementation ignores it.
+    virtual void SetCloseCallback(base::RepeatingClosure close) {}
     // A message from the client; forward it with `to_agent`, answer it with
     // `to_client`, or both.
     virtual void OnClientMessage(std::string message) = 0;
@@ -217,11 +254,54 @@ class CONTENT_EXPORT DevToolsManagerDelegate {
   };
   // Shuttle: returns a filter for a new WebSocket connection, or nullptr.
   // `session_id` is set for /devtools/session/<session_id> (a browser-level
-  // connection; nullptr rejects it), `target_id` for /devtools/page/<target_id>
-  // (nullptr leaves it unfiltered).
+  // connection; nullptr rejects it), `target_id` for /devtools/page/<target_id>.
+  // Used only by the default DecideConnection(): the null result has no
+  // meaning of its own to the HTTP layer (see ConnectionDecision).
   virtual std::unique_ptr<ConnectionFilter> CreateConnectionFilter(
       const std::string& session_id,
-      const std::string& target_id);
+      const std::string& target_id,
+      const RequestContext& context);
+
+  // Shuttle: the explicit decision for one new WebSocket connection. A null
+  // filter never means "unfiltered": the HTTP layer only grants raw access
+  // for kAdminAllowed and only accepts kScopedFilter with a non-null filter.
+  enum class ConnectionKind {
+    kBrowser,  // /devtools/browser/<guid>
+    kSession,  // /devtools/session/<session_id>
+    kPage,     // /devtools/page/<target_id>
+  };
+  struct CONTENT_EXPORT ConnectionDecision {
+    enum class Kind {
+      // The caller has full access to the endpoint's agent host.
+      kAdminAllowed,
+      // The connection runs through `filter` (never null for this kind).
+      kScopedFilter,
+      // Rejected before the WebSocket is accepted: `http_status` is 404
+      // (unknown or stale owner) or 403 (not authorized).
+      kDenied,
+    };
+
+    ConnectionDecision();
+    ConnectionDecision(ConnectionDecision&& other);
+    ConnectionDecision& operator=(ConnectionDecision&& other);
+    ~ConnectionDecision();
+
+    static ConnectionDecision AdminAllowed();
+    static ConnectionDecision Scoped(std::unique_ptr<ConnectionFilter> filter);
+    static ConnectionDecision Denied(int http_status);
+
+    Kind kind = Kind::kDenied;
+    std::unique_ptr<ConnectionFilter> filter;
+    int http_status = 403;
+  };
+  // The default implementation keeps the legacy semantics, explicitly: the
+  // browser socket is admin-allowed; a session socket is scoped by
+  // CreateConnectionFilter() or denied with 404; a page socket is scoped by
+  // CreateConnectionFilter() or, when it returns nullptr, admin-allowed.
+  virtual ConnectionDecision DecideConnection(ConnectionKind kind,
+                                              const std::string& session_id,
+                                              const std::string& target_id,
+                                              const RequestContext& context);
 
   virtual ~DevToolsManagerDelegate();
 };

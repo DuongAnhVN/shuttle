@@ -451,6 +451,7 @@ source_set("browser_sources") {
     "startup_helper.cc",
     "startup_helper.h",
     "storage_notification_service.h",
+    "storage_partition.cc",
     "storage_partition.h",
     "storage_partition_config.cc",
     "storage_partition_config.h",

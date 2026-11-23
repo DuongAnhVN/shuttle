@@ -197,8 +197,26 @@ interface GssapiLibraryLoadObserver {
 // to. It must not be sent to any untrusted process like a renderer process.
 // The network sandbox may be disabled (to kNoSandbox) by policy, and may not
 // be available on all platforms.
+enum StorageHandoffReleaseResult {
+  kRejected,
+  kReleased,
+};
+
+// Dropping this pipe abandons preparation, never releases workload.
+interface StorageHandoffTransaction {
+  Release() => (StorageHandoffReleaseResult result);
+  // Fault injection outside the synchronous validation/bind batch. Holding a
+  // reply does not prevent Release from running or workload from dispatching.
+  HoldReleaseReplyForTesting();
+  DropReleaseReplyForTesting();
+};
+
 [ServiceSandbox=sandbox.mojom.Sandbox.kNetwork]
 interface NetworkService {
+  BeginStorageHandoff(pending_receiver<StorageHandoffTransaction> receiver,
+      array<StorageHandoffMember> expected)
+      => (mojo_base.mojom.UnguessableToken service_instance,
+          mojo_base.mojom.UnguessableToken transaction);
   // Sets the parameters and initializes the service.
   SetParams(NetworkServiceParams params);
 
@@ -565,4 +583,3 @@ interface DurableMessageCollector {
          bool case_sensitive)
       => (array<MessageSearchMatch>? matches);
 };
-

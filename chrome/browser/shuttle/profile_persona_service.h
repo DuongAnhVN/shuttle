@@ -53,8 +53,15 @@ class ProfilePersonaService : public KeyedService {
   base::CallbackListSubscription AddChangeCallback(
       ChangeCallbackList::CallbackType callback);
 
-  // The stored persona: kNone if there is none, kCorrupt for an unreadable
-  // value (never applied in part).
+  // Whether the Profile is a managed (isolated) one: it carries the marker
+  // pref written by managed_profile_bootstrap (prefs::kManagedProfile). A
+  // managed Profile fails closed: no persona reads as kCorrupt, Clear() is
+  // refused and a context without a readable persona cannot reach the
+  // network. Unmanaged (legacy/startup) Profiles keep the old semantics.
+  bool IsManaged() const;
+
+  // The stored persona: kNone if there is none (never for a managed Profile),
+  // kCorrupt for an unreadable value (never applied in part).
   StoredFingerprintPersona Lookup() const;
   // The persona if there is a readable one (state kPersona).
   std::optional<FingerprintPersona> Get() const;
@@ -66,7 +73,8 @@ class ProfilePersonaService : public KeyedService {
   // Stores `persona` (which must pass CheckFingerprintPersona; an incoherent
   // one is refused: returns false, nothing written) and notifies.
   bool Set(const FingerprintPersona& persona);
-  // Removes the stored persona (readable or not) and notifies.
+  // Removes the stored persona (readable or not) and notifies. Refused (no
+  // effect) for a managed Profile.
   void Clear();
 
   // Runs the change callbacks. Set and Clear call it; call it yourself only

@@ -26,6 +26,13 @@ inline constexpr char kThrowawayIdleTimeoutSwitch[] =
 inline constexpr char kMaxThrowawayAgentsSwitch[] =
     "shuttle-max-throwaway-agents";
 
+// Opt-in (off by default): multiple isolated Chromium Profiles in this
+// browser, managed through the browser-level tools of
+// tools/shuttle/docs/PROFILES.md (create/list/load/stop/delete-browser-profile).
+// Without it the browser behaves as before: one startup Profile, legacy
+// agents, no ShuttleBrowserProfiles.json, no admin token file.
+inline constexpr char kIsolatedProfilesSwitch[] = "shuttle-isolated-profiles";
+
 }  // namespace shuttle
 
 #endif  // CHROME_BROWSER_SHUTTLE_SWITCHES_H_

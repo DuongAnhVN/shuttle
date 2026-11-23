@@ -120,6 +120,16 @@ ProfileProxyService::ProfileProxyService(
 
 ProfileProxyService::~ProfileProxyService() = default;
 
+void ProfileProxyService::AdoptBootstrapEncryptor(
+    scoped_refptr<os_crypt_async::Encryptor> encryptor) {
+  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+  if (encryptor) {
+    encryption_requested_ = true;
+    weak_factory_.InvalidateWeakPtrs();
+    OnEncryptorReady(std::move(encryptor));
+  }
+}
+
 void ProfileProxyService::InitEncryption(
     os_crypt_async::OSCryptAsync* os_crypt_async) {
   DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);

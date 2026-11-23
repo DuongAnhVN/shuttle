@@ -189,6 +189,7 @@ source_set("impl") {
     "//chrome/browser/safe_browsing",
     "//chrome/browser/shuttle:agent_partition",
     "//chrome/browser/shuttle:agent_persona",
+    "//chrome/browser/shuttle:managed_network_admission",
     "//chrome/browser/shuttle:agent_proxy",
     "//chrome/browser/ssl",
     "//chrome/browser/task_manager",
@@ -370,4 +371,3 @@ if (is_android) {
     }
   }
 }
-

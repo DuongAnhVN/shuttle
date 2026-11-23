@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "chrome/browser/profiles/profile_impl.h"
+#include "chrome/browser/shuttle/managed_network_admission.h"
 
 #include <stddef.h>
 
@@ -89,6 +90,7 @@
 #include "chrome/browser/push_messaging/push_messaging_service_impl.h"
 #include "chrome/browser/reduce_accept_language/reduce_accept_language_factory.h"
 #include "chrome/browser/sessions/exit_type_service.h"
+#include "chrome/browser/shuttle/managed_profile_bootstrap.h"
 #include "chrome/browser/signin/identity_manager_factory.h"
 #include "chrome/browser/ssl/https_first_mode_settings_tracker.h"
 #include "chrome/browser/ssl/stateful_ssl_host_state_delegate_factory.h"
@@ -442,6 +444,7 @@ ProfileImpl::ProfileImpl(
       start_time_(base::Time::Now()),
       delegate_(delegate) {
   TRACE_EVENT0("browser,startup", "ProfileImpl::ctor");
+  shuttle::BeginManagedNetworkAdmission(this);
   DCHECK(!path.empty()) << "Using an empty path will attempt to write "
                         << "profile files to the root directory!";
 
@@ -964,6 +967,7 @@ void ProfileImpl::OnSyncToSigninMigrationMaybeCompleted(
 void ProfileImpl::OnPrefsLoaded(CreateMode create_mode, bool success) {
   TRACE_EVENT0("browser", "ProfileImpl::OnPrefsLoaded");
   if (!success) {
+    shuttle::FinishManagedNetworkAdmission(this, false);
     if (delegate_)
       delegate_->OnProfileCreationFinished(this, create_mode, false, false);
     return;
@@ -973,6 +977,33 @@ void ProfileImpl::OnPrefsLoaded(CreateMode create_mode, bool success) {
   // UI, finalising profile creation, etc. which would trigger a crash down the
   // the line. See crbug.com/40475418
   if (g_browser_process->IsShuttingDown()) {
+    shuttle::FinishManagedNetworkAdmission(this, false);
+    if (delegate_)
+      delegate_->OnProfileCreationFinished(this, create_mode, false, false);
+    return;
+  }
+
+  // Shuttle (tools/shuttle/docs/PROFILES.md section 6): the managed-profile
+  // bootstrap runs HERE: prefs are loaded, but OnLocaleReady() below is what
+  // creates the bulk keyed services (including ProfileNetworkContextService).
+  // Extension preference services may already exist. Content holds pending
+  // NetworkContext receivers behind managed_network_admission until this
+  // bootstrap validates/restores the persona, provisions
+  // the workspace prefs and prepares the proxy encryptor through PrefService,
+  // and completes synchronously for every unmanaged profile. Do not move
+  // identity-dependent service or StoragePartition creation above this.
+  shuttle::PrepareManagedProfile(
+      this, /*allow_async=*/create_mode == CreateMode::kAsynchronous,
+      base::BindOnce(&ProfileImpl::OnManagedProfileBootstrapped,
+                     weak_ptr_factory_.GetWeakPtr(), create_mode));
+}
+
+void ProfileImpl::OnManagedProfileBootstrapped(CreateMode create_mode,
+                                               bool success) {
+  TRACE_EVENT0("browser", "ProfileImpl::OnManagedProfileBootstrapped");
+  if (!success) {
+    // Fail closed: a managed profile that cannot restore its identity never
+    // loads (no stock fallback).
     if (delegate_)
       delegate_->OnProfileCreationFinished(this, create_mode, false, false);
     return;
