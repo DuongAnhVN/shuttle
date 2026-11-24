@@ -1258,7 +1258,7 @@ constexpr char kUpdateAgentArgs[] = R"({"type":"object","properties":{
 
 constexpr char kOpenSessionArgs[] = R"({"type":"object","properties":{
   "agent":{"type":"string","description":"Agent id."},
-  "idleTimeoutMinutes":{"type":"integer","description":"Close the session after this many minutes without activity (default 30; 0 = never)."}},
+  "idleTimeoutMinutes":{"type":"integer","description":"Close the session after this many minutes without activity (default 0 = never)."}},
   "required":["agent"]})";
 
 constexpr char kUpdateSessionArgs[] = R"({"type":"object","properties":{
@@ -1390,8 +1390,8 @@ constexpr Tool kTools[] = {
      "storage), new pages (Target.createTarget, Playwright newPage) become "
      "session tabs, and Browser.close ends the session. Don't create browser "
      "contexts. Tabs you create over CDP close when that connection ends; "
-     "use allocate-tab for a tab that must stay. The session closes after "
-     "idleTimeoutMinutes (default 30) without activity (MCP calls, CDP "
+     "use allocate-tab for a tab that must stay. With a timeout set, the session closes after "
+     "idleTimeoutMinutes (default 0 = never) without activity (MCP calls, CDP "
      "messages, the user switching to its tabs). Warns if the agent already "
      "has open sessions: reuse or close them.",
      kOpenSessionArgs, &OpenSession},

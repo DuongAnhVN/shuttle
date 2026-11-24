@@ -14,7 +14,7 @@ namespace shuttle {
 inline constexpr char kOpenAgentsSwitch[] = "shuttle-open-agents";
 
 // Idle timeout of MCP sessions in minutes (0 = off; "<n>s" = seconds, for
-// probes). Default 30. A session can override it (open-session,
+// probes). Default 0: sessions never time out. A session can set its own (open-session,
 // update-session idleTimeoutMinutes).
 inline constexpr char kSessionIdleTimeoutSwitch[] =
     "shuttle-session-idle-timeout";

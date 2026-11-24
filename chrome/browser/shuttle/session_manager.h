@@ -67,7 +67,7 @@ struct Session {
 
 // Browser-wide default idle timeout of MCP sessions:
 // --shuttle-session-idle-timeout=<minutes> (0 = off; "<n>s" = seconds, for
-// probes). Default 30 minutes.
+// probes). Default: none (sessions never time out).
 base::TimeDelta DefaultSessionIdleTimeout();
 
 // Also keeps the session tab groups in sync with the agents' identities, both

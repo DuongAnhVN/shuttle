@@ -90,7 +90,7 @@ connection filtered to the session (content hook `DevToolsManagerDelegate::Creat
   `allocate-tab`, tabs handed to the agent and popups stay with the session. Use `allocate-tab` for a tab that must
   outlive the connection; a new connection always lists the session's tabs (Playwright `pages()`).
 - **Idle timeout:** a session closes (tabs, cookie flush, sidecar) after `idleTimeoutMinutes` without activity:
-  default 30 (`--shuttle-session-idle-timeout=<minutes>`, 0 = off; `<n>s` for probes), per session on
+  default 0 = never (2026-11-24: sessions no longer time out unless asked; `--shuttle-session-idle-timeout=<minutes>`, 0 = off; `<n>s` for probes), per session on
   `open-session`, changed later with `update-session` (0 = never, e.g. before a long sign-in by a person).
   Activity = MCP calls naming the session or one of its tabs, client messages on its CDP connections, and a person
   switching to one of its tabs (or looking at it when the timeout hits; never in `--headless`, where windows are

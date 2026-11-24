@@ -22,6 +22,7 @@
 #include "chrome/browser/autocomplete/in_memory_url_index_factory.h"
 #include "chrome/browser/autocomplete/provider_state_service_factory.h"
 #include "chrome/browser/autocomplete/shortcuts_backend_factory.h"
+#include "chrome/browser/autocomplete/zero_suggest_cache_service_factory.h"
 #include "chrome/browser/background/background_contents_service_factory.h"
 #include "chrome/browser/background_fetch/background_fetch_delegate_factory.h"
 #include "chrome/browser/background_sync/background_sync_controller_factory.h"
@@ -829,6 +830,7 @@ void ChromeBrowserMainExtraPartsProfiles::
   // SyncServiceFactory's DependsOn() list, which is gone with the sync stack.
   IdentityManagerFactory::GetInstance();
   gcm::GCMProfileServiceFactory::GetInstance();
+  ZeroSuggestCacheServiceFactory::GetInstance();
 }
 
 void ChromeBrowserMainExtraPartsProfiles::PreProfileInit() {

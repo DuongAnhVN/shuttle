@@ -216,7 +216,10 @@ TabLocation FindInTabStrips(content::WebContents* contents) {
 // How often idle sessions are looked for (also bounds the timeout's
 // precision).
 constexpr base::TimeDelta kIdleCheckInterval = base::Seconds(5);
-constexpr base::TimeDelta kDefaultIdleTimeout = base::Minutes(30);
+// Zero = never: a session stays open until it is closed. A timeout is opt-in
+// (--shuttle-session-idle-timeout, or idleTimeoutMinutes on open-session /
+// update-session).
+constexpr base::TimeDelta kDefaultIdleTimeout = base::TimeDelta();
 
 // True if `contents` is the active tab of the focused window: a person is
 // looking at it.
