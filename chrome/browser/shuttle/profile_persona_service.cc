@@ -10,8 +10,10 @@
 #include <vector>
 
 #include "base/check.h"
+#include "base/logging.h"
 #include "base/values.h"
 #include "chrome/browser/profiles/profile.h"
+#include "chrome/browser/shuttle/agent_proxy.h"
 #include "chrome/browser/shuttle/persona_runtime.h"
 #include "chrome/browser/shuttle/pref_names.h"
 #include "components/prefs/pref_service.h"
@@ -41,8 +43,22 @@ StoredFingerprintPersona ProfilePersonaService::Lookup() const {
   }
   // The user value only: the registered default is an empty dictionary, which
   // would read as corrupt.
-  return FingerprintPersonaFromPrefValue(
-      pref_service->GetUserPrefValue(prefs::kFingerprintPersona));
+  const base::Value* value =
+      pref_service->GetUserPrefValue(prefs::kFingerprintPersona);
+  if (!value && IsManaged()) {
+    // A managed (isolated) Profile always has a committed persona: its
+    // absence is corruption, never "no persona" (no stock fallback).
+    StoredFingerprintPersona corrupt;
+    corrupt.state = StoredFingerprintPersona::State::kCorrupt;
+    return corrupt;
+  }
+  return FingerprintPersonaFromPrefValue(value);
+}
+
+bool ProfilePersonaService::IsManaged() const {
+  PrefService* pref_service = profile_ ? profile_->GetPrefs() : nullptr;
+  return pref_service && pref_service->FindPreference(prefs::kManagedProfile) &&
+         pref_service->GetUserPrefValue(prefs::kManagedProfile) != nullptr;
 }
 
 std::optional<FingerprintPersona> ProfilePersonaService::Get() const {
@@ -80,6 +96,13 @@ void ProfilePersonaService::Clear() {
   if (!pref_service || !pref_service->FindPreference(prefs::kFingerprintPersona)) {
     return;
   }
+  if (IsManaged()) {
+    // Clearing would turn an isolated Profile into a stock one. A managed
+    // persona is only ever replaced (Set), never removed.
+    LOG(WARNING) << "Shuttle: refusing to clear the persona of a managed "
+                    "profile.";
+    return;
+  }
   pref_service->ClearPref(prefs::kFingerprintPersona);
   NotifyChanged();
 }
@@ -97,6 +120,12 @@ bool ProfilePersonaService::ConfigureNetworkContextParams(
   }
   std::optional<FingerprintPersona> persona = Get();
   if (!persona) {
+    if (IsManaged()) {
+      // Defense in depth (the bootstrap does not let such a Profile load):
+      // a managed Profile without a readable persona gets a context that
+      // cannot reach the network, not the stock identity.
+      params->initial_proxy_config = FailClosedNetConfig();
+    }
     return false;
   }
   params->accept_language = AcceptLanguageHeaderForPersona(*persona);

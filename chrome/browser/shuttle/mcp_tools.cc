@@ -5,9 +5,11 @@
 #include "chrome/browser/shuttle/mcp_tools.h"
 
 #include <algorithm>
+#include <initializer_list>
 #include <map>
 #include <optional>
 #include <set>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -23,9 +25,14 @@
 #include "base/strings/utf_string_conversions.h"
 #include "base/time/time.h"
 #include "base/timer/timer.h"
+#include "base/types/expected.h"
+#include "base/uuid.h"
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/shuttle/agent_proxy.h"
+#include "chrome/browser/shuttle/browser_profile_registry.h"
+#include "chrome/browser/shuttle/browser_profile_router.h"
 #include "chrome/browser/shuttle/fingerprint_persona.h"
+#include "chrome/browser/shuttle/managed_profile_bootstrap.h"
 #include "chrome/browser/shuttle/network_access.h"
 #include "chrome/browser/shuttle/persona_runtime.h"
 #include "chrome/browser/shuttle/profile_persona_service.h"
@@ -34,6 +41,7 @@
 #include "chrome/browser/shuttle/profile_proxy_service_factory.h"
 #include "chrome/browser/shuttle/profile_registry.h"
 #include "chrome/browser/shuttle/proxy_check.h"
+#include "chrome/browser/shuttle/scope_auth.h"
 #include "chrome/browser/shuttle/session_manager.h"
 #include "chrome/browser/shuttle/shuttle_service.h"
 #include "components/viz/common/frame_sinks/copy_output_result.h"
@@ -65,10 +73,21 @@ std::string HostOrDefault(const ToolContext& context) {
   return context.host.empty() ? std::string("127.0.0.1:9222") : context.host;
 }
 
+// "?grant=<g>" for a scoped endpoint of `session_id` (isolated Profiles on), or
+// "". The grant is the per-session bearer credential, never the admin token.
+std::string GrantQuery(const std::string& session_id) {
+  std::string grant = SessionGrants::Get().GrantFor(session_id);
+  return grant.empty() ? std::string() : "?grant=" + grant;
+}
+
 std::string PageWebSocketUrl(const ToolContext& context,
                              const std::string& target_id) {
-  return WithAccessToken(base::StrCat(
-      {"ws://", HostOrDefault(context), "/devtools/page/", target_id}));
+  std::string query;
+  if (content::WebContents* contents = SessionManager::FindTab(target_id)) {
+    query = GrantQuery(SessionManager::SessionOf(contents));
+  }
+  return WithAccessToken(base::StrCat({"ws://", HostOrDefault(context),
+                                       "/devtools/page/", target_id, query}));
 }
 
 const std::string* GetString(const base::DictValue& args,
@@ -152,8 +171,10 @@ bool GetBoolArg(const base::DictValue& args,
   return true;
 }
 
-// Resolves `targetId` to a tab leased to some session.
-content::WebContents* GetLeasedTab(const base::DictValue& args,
+// Resolves `targetId` to a tab leased to a session of THIS service (target ids
+// are browser-wide: a tab of another Profile's session is not found).
+content::WebContents* GetLeasedTab(const ToolContext& context,
+                                   const base::DictValue& args,
                                    std::string* error) {
   const std::string* target_id = GetString(args, "targetId");
   if (!target_id) {
@@ -161,7 +182,8 @@ content::WebContents* GetLeasedTab(const base::DictValue& args,
     return nullptr;
   }
   content::WebContents* contents = SessionManager::FindTab(*target_id);
-  if (!contents || SessionManager::SessionOf(contents).empty()) {
+  if (!contents || SessionManager::SessionOf(contents).empty() ||
+      !context.service->sessions().Get(SessionManager::SessionOf(contents))) {
     *error = "Unknown or unleased tab: " + *target_id;
     return nullptr;
   }
@@ -341,6 +363,18 @@ void SetFingerprint(const ToolContext& context,
   const base::Value* value = args.Find("fingerprint");
   if (!value) {
     std::move(callback).Run(ToolResult::Error(MissingArgument("fingerprint")));
+    return;
+  }
+  if (service->IsManaged()) {
+    // A ready managed (isolated) Profile's persona never changes live: it is
+    // replaced only while the Profile is `stopped` (PROFILES.md section 7), by
+    // ShuttleService::HandleHttpMcpRequest -> BrowserProfileRouter::
+    // ReplacePersona, the only path that reaches a stopped Profile. This is
+    // the defensive end of any other route: never cleared (no stock
+    // fallback), never changed while ready.
+    std::move(callback).Run(ToolResult::ProfileFailure(BrowserProfileFailure(
+        value->is_none() ? BrowserProfileError::kPersonaInvalid
+                         : BrowserProfileError::kProfileBusy)));
     return;
   }
   if (value->is_none()) {
@@ -959,7 +993,14 @@ void OpenSession(const ToolContext& context,
                       .Set("tabs", static_cast<int>(
                                        sessions.TabsOf(other->id).size())));
   }
-  const Session& session = sessions.Open(*agent, *idle_timeout);
+  const Session* opened = sessions.Open(*agent, *idle_timeout);
+  if (!opened) {
+    // Isolated Profiles on and this Profile accepts no work (draining).
+    std::move(callback).Run(ToolResult::ProfileFailure(
+        BrowserProfileFailure(BrowserProfileError::kProfileNotReady)));
+    return;
+  }
+  const Session& session = *opened;
   base::DictValue result = DescribeSession(context, session);
   if (!others.empty()) {
     result.Set("warning",
@@ -970,9 +1011,12 @@ void OpenSession(const ToolContext& context,
     result.Set("openSessions", std::move(others));
   }
   // A browser-level CDP connection scoped to the session.
+  // With isolated Profiles on the endpoint carries the session's own bearer
+  // grant (?grant=), bound to its owner tuple and revoked with the session.
   result.Set("cdpEndpoint",
              WithAccessToken(base::StrCat({"ws://", HostOrDefault(context),
-                                           "/devtools/session/", session.id})));
+                                           "/devtools/session/", session.id,
+                                           GrantQuery(session.id)})));
   std::move(callback).Run(ToolResult::Json(base::Value(std::move(result))));
 }
 
@@ -1062,7 +1106,7 @@ void ReleaseTab(const ToolContext& context,
                 const base::DictValue& args,
                 ToolCallback callback) {
   std::string error;
-  content::WebContents* contents = GetLeasedTab(args, &error);
+  content::WebContents* contents = GetLeasedTab(context, args, &error);
   if (!contents) {
     std::move(callback).Run(ToolResult::Error(error));
     return;
@@ -1133,7 +1177,7 @@ void NavigateTab(const ToolContext& context,
                  const base::DictValue& args,
                  ToolCallback callback) {
   std::string error;
-  content::WebContents* contents = GetLeasedTab(args, &error);
+  content::WebContents* contents = GetLeasedTab(context, args, &error);
   const std::string* url_string = GetString(args, "url");
   if (!contents || !url_string) {
     std::move(callback).Run(
@@ -1155,7 +1199,7 @@ void SetTabViewport(const ToolContext& context,
                     const base::DictValue& args,
                     ToolCallback callback) {
   std::string error;
-  content::WebContents* contents = GetLeasedTab(args, &error);
+  content::WebContents* contents = GetLeasedTab(context, args, &error);
   std::optional<gfx::Size> size;
   if (contents) {
     size = GetViewport(args, &error);
@@ -1178,7 +1222,7 @@ void CaptureTab(const ToolContext& context,
                 const base::DictValue& args,
                 ToolCallback callback) {
   std::string error;
-  content::WebContents* contents = GetLeasedTab(args, &error);
+  content::WebContents* contents = GetLeasedTab(context, args, &error);
   if (!contents) {
     std::move(callback).Run(ToolResult::Error(error));
     return;
@@ -1227,6 +1271,235 @@ void CaptureTab(const ToolContext& context,
           },
           png, std::move(callback)));
 }
+
+// Browser-level tools -------------------------------------------------------
+//
+// Not bound to a Profile: routed through BrowserProfileRouter, admin-only
+// (except get-capabilities), schemas reject unknown properties. There is no
+// invalid-argument error code in the contract: malformed arguments use
+// profile_failed with a fixed message (never an echo of the input).
+
+// The router, or null after replying `unsupported` (isolated profiles off).
+BrowserProfileRouter* RouterOrReply(ToolCallback& callback) {
+  BrowserProfileRouter* router = BrowserProfileRouter::Get();
+  if (!router) {
+    std::move(callback).Run(
+        ToolResult::ProfileFailure(BrowserProfileError::kUnsupported));
+  }
+  return router;
+}
+
+ToolResult BadArguments() {
+  return ToolResult::ProfileFailure(BrowserProfileFailure(
+      BrowserProfileError::kProfileFailed, "Unexpected or malformed arguments."));
+}
+
+// Every key of `args` is one of `allowed` (additionalProperties:false).
+bool OnlyKeys(const base::DictValue& args,
+              std::initializer_list<std::string_view> allowed) {
+  for (const auto [key, value] : args) {
+    if (std::find(allowed.begin(), allowed.end(), std::string_view(key)) ==
+        allowed.end()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void ReplyRecord(ToolCallback callback,
+                 base::expected<ProfileRecord, BrowserProfileFailure> result) {
+  if (!result.has_value()) {
+    std::move(callback).Run(ToolResult::ProfileFailure(result.error()));
+    return;
+  }
+  std::move(callback).Run(ToolResult::Json(
+      base::Value(base::DictValue().Set("profile", result->ToValue()))));
+}
+
+void GetCapabilitiesTool(const base::DictValue& args, ToolCallback callback) {
+  if (!args.empty()) {
+    std::move(callback).Run(BadArguments());
+    return;
+  }
+  std::move(callback).Run(ToolResult::Json(base::Value(BuildCapabilities())));
+}
+
+void CreateBrowserProfileTool(const base::DictValue& args,
+                              ToolCallback callback) {
+  BrowserProfileRouter* router = RouterOrReply(callback);
+  if (!router) {
+    return;
+  }
+  const std::string* request_id = args.FindString("requestId");
+  const std::string* workspace = args.FindString("workspaceAgent");
+  const base::DictValue* persona = args.FindDict("persona");
+  const base::Value* proxy = args.Find("proxy");
+  if (!OnlyKeys(args,
+                {"requestId", "workspaceAgent", "persona", "proxy"}) ||
+      !request_id || !workspace || !persona ||
+      !IsValidWorkspaceAgentSlug(*workspace) ||
+      (proxy && !(proxy->is_none() || proxy->is_string() ||
+                  proxy->is_dict()))) {
+    std::move(callback).Run(BadArguments());
+    return;
+  }
+  base::Uuid uuid = base::Uuid::ParseCaseInsensitive(*request_id);
+  if (!uuid.is_valid()) {
+    std::move(callback).Run(BadArguments());
+    return;
+  }
+  CreateProfileArgs create;
+  create.request_id = uuid.AsLowercaseString();
+  create.workspace_agent = *workspace;
+  create.persona = base::Value(persona->Clone());
+  if (proxy && !proxy->is_none()) {
+    create.proxy = proxy->Clone();
+  }
+  router->CreateProfile(std::move(create),
+                        base::BindOnce(&ReplyRecord, std::move(callback)));
+}
+
+void ListBrowserProfilesTool(const base::DictValue& args,
+                             ToolCallback callback) {
+  BrowserProfileRouter* router = RouterOrReply(callback);
+  if (!router) {
+    return;
+  }
+  if (!args.empty()) {
+    std::move(callback).Run(BadArguments());
+    return;
+  }
+  base::expected<ProfileList, BrowserProfileFailure> list =
+      router->ListProfiles();
+  if (!list.has_value()) {
+    std::move(callback).Run(ToolResult::ProfileFailure(list.error()));
+    return;
+  }
+  base::ListValue profiles;
+  for (const ProfileRecord& record : list->profiles) {
+    base::DictValue value = record.ToValue();
+    // A ready Profile reports its live committed persona (a persona replaced
+    // while drained is not in the registry's first-load summary).
+    if (record.lifecycle == "ready") {
+      base::expected<ResolvedProfile, BrowserProfileFailure> resolved =
+          router->Resolve(record.core_profile_key);
+      if (resolved.has_value()) {
+        if (std::optional<base::DictValue> summary =
+                ManagedProfilePersonaSummary(resolved->profile)) {
+          value.Set("personaSummary", std::move(*summary));
+        }
+      }
+    }
+    profiles.Append(std::move(value));
+  }
+  std::move(callback).Run(ToolResult::Json(base::Value(
+      base::DictValue()
+          .Set("profiles", std::move(profiles))
+          .Set("browserEpoch", list->browser_epoch))));
+}
+
+// `{coreProfileKey}` only. Replies and returns null on bad arguments.
+const std::string* GetKeyArgument(const base::DictValue& args,
+                                  ToolCallback& callback) {
+  if (!OnlyKeys(args, {"coreProfileKey"})) {
+    std::move(callback).Run(BadArguments());
+    return nullptr;
+  }
+  const std::string* key = args.FindString("coreProfileKey");
+  if (!key || !IsValidBrowserProfileKey(*key)) {
+    std::move(callback).Run(
+        ToolResult::ProfileFailure(BrowserProfileError::kInvalidProfileKey));
+    return nullptr;
+  }
+  return key;
+}
+
+void LoadBrowserProfileTool(const base::DictValue& args,
+                            ToolCallback callback) {
+  BrowserProfileRouter* router = RouterOrReply(callback);
+  if (!router) {
+    return;
+  }
+  if (const std::string* key = GetKeyArgument(args, callback)) {
+    router->LoadProfile(*key,
+                        base::BindOnce(&ReplyRecord, std::move(callback)));
+  }
+}
+
+void StopBrowserProfileTool(const base::DictValue& args,
+                            ToolCallback callback) {
+  BrowserProfileRouter* router = RouterOrReply(callback);
+  if (!router) {
+    return;
+  }
+  if (const std::string* key = GetKeyArgument(args, callback)) {
+    router->StopProfile(*key,
+                        base::BindOnce(&ReplyRecord, std::move(callback)));
+  }
+}
+
+void DeleteBrowserProfileTool(const base::DictValue& args,
+                              ToolCallback callback) {
+  BrowserProfileRouter* router = RouterOrReply(callback);
+  if (!router) {
+    return;
+  }
+  if (const std::string* key = GetKeyArgument(args, callback)) {
+    router->DeleteProfile(*key,
+                          base::BindOnce(&ReplyRecord, std::move(callback)));
+  }
+}
+
+constexpr char kBrowserNoArgs[] =
+    R"({"type":"object","properties":{},"additionalProperties":false})";
+
+constexpr char kCreateBrowserProfileArgs[] = R"({"type":"object","properties":{
+  "requestId":{"type":"string","format":"uuid","description":"Idempotency key: the same requestId with the same arguments returns the same profile; with different arguments it fails with request_conflict."},
+  "workspaceAgent":{"type":"string","pattern":"^[a-z0-9]+(-[a-z0-9]+)*$","maxLength":64,"description":"The workspace agent (storage partition slug) created inside the new Chromium Profile. Not \"tmp-\"."},
+  "persona":{"type":"object","description":"The profile's fingerprint persona (same fields as set-fingerprint; preset required). The seed is generated by the browser and never returned."},
+  "proxy":{"oneOf":[{"type":"string"},{"type":"object"}],"description":"Optional proxy of the workspace agent (same forms as create-agent). It is stored encrypted; a proxy that cannot be read back fails the load with proxy_not_ready."}},
+  "required":["requestId","workspaceAgent","persona"],"additionalProperties":false})";
+
+constexpr char kCoreProfileKeyArgs[] = R"({"type":"object","properties":{
+  "coreProfileKey":{"type":"string","pattern":"^bp_[0-9a-f]{32}$"}},
+  "required":["coreProfileKey"],"additionalProperties":false})";
+
+constexpr BrowserTool kBrowserTools[] = {
+    {"get-capabilities",
+     "Capabilities of this browser: {capabilitiesVersion, isolatedProfiles: "
+     "{supported, enabled}, scopedRouting, profileScopeMetadata, "
+     "bindingVersion, browserEpoch}. Public and read-only. Clients must not "
+     "attempt isolated profile operations unless supported, enabled and "
+     "scopedRouting are all true.",
+     kBrowserNoArgs, /*admin_only=*/false, &GetCapabilitiesTool},
+    {"create-browser-profile",
+     "Admin only. Create a persistent isolated Chromium Profile (stopped). "
+     "Idempotent by requestId. Returns {profile}: coreProfileKey, "
+     "workspaceAgent, lifecycleEpoch, browserEpoch, lifecycle, loaded, "
+     "deletionPending, personaSummary, lastErrorCode (no paths, seeds or "
+     "credentials). Takes no profile selector.",
+     kCreateBrowserProfileArgs, /*admin_only=*/true,
+     &CreateBrowserProfileTool},
+    {"list-browser-profiles",
+     "Admin only. List the isolated Chromium Profiles and the browserEpoch. "
+     "Takes no profile selector.",
+     kBrowserNoArgs, /*admin_only=*/true, &ListBrowserProfilesTool},
+    {"load-browser-profile",
+     "Admin only. Load a Chromium Profile and wait until it is ready (the "
+     "persona and proxy are in place before any work). Concurrent loads of "
+     "one key share one initialisation. Returns {profile}.",
+     kCoreProfileKeyArgs, /*admin_only=*/true, &LoadBrowserProfileTool},
+    {"stop-browser-profile",
+     "Admin only. Drain a Chromium Profile (close its sessions, tabs, workers "
+     "and connections, flush storage) and report it stopped. Never stops the "
+     "browser or another profile. drain_timeout leaves it draining.",
+     kCoreProfileKeyArgs, /*admin_only=*/true, &StopBrowserProfileTool},
+    {"delete-browser-profile",
+     "Admin only. Delete a stopped Chromium Profile with no sessions, tabs, "
+     "workers or connections (profile_busy otherwise). Never the startup "
+     "profile.",
+     kCoreProfileKeyArgs, /*admin_only=*/true, &DeleteBrowserProfileTool},
+};
 
 // Tool table ----------------------------------------------------------------
 
@@ -1457,6 +1730,25 @@ ToolResult ToolResult::Error(std::string message) {
 }
 
 // static
+ToolResult ToolResult::ProfileFailure(const BrowserProfileFailure& failure) {
+  base::DictValue payload =
+      base::DictValue().Set("error", failure.ToValue());
+  ToolResult result;
+  result.is_error = true;
+  result.content.Append(
+      base::DictValue()
+          .Set("type", "text")
+          .Set("text", base::WriteJson(payload).value_or("{}")));
+  result.structured_content = std::move(payload);
+  return result;
+}
+
+// static
+ToolResult ToolResult::ProfileFailure(BrowserProfileError code) {
+  return ProfileFailure(BrowserProfileFailure(code));
+}
+
+// static
 ToolResult ToolResult::Image(std::string base64_data, std::string mime_type) {
   ToolResult result;
   result.content.Append(base::DictValue()
@@ -1480,6 +1772,19 @@ base::DictValue ToolResult::ToValue() && {
 
 base::span<const Tool> GetTools() {
   return kTools;
+}
+
+base::span<const BrowserTool> GetBrowserTools() {
+  return kBrowserTools;
+}
+
+const BrowserTool* FindBrowserTool(std::string_view name) {
+  for (const BrowserTool& tool : kBrowserTools) {
+    if (tool.name == name) {
+      return &tool;
+    }
+  }
+  return nullptr;
 }
 
 }  // namespace shuttle

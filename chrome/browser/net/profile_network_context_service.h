@@ -44,6 +44,11 @@
 class PrefRegistrySimple;
 class Profile;
 
+namespace content {
+class NetworkContextHandoffProof;
+class StoragePartition;
+}
+
 namespace net {
 class ClientCertStore;
 
@@ -81,6 +86,15 @@ class ProfileNetworkContextService
   // the BrowserContext, using the specified parameters. An empty
   // |relative_partition_path| corresponds to the main network context.
   void ConfigureNetworkContextParams(
+      bool in_memory,
+      const base::FilePath& relative_partition_path,
+      network::mojom::NetworkContextParams* network_context_params,
+      cert_verifier::mojom::CertVerifierCreationParams*
+          cert_verifier_creation_params);
+
+  bool ConfigureNetworkContextParamsForHandoff(
+      content::StoragePartition* participant,
+      const content::NetworkContextHandoffProof& proof,
       bool in_memory,
       const base::FilePath& relative_partition_path,
       network::mojom::NetworkContextParams* network_context_params,
@@ -221,7 +235,9 @@ class ProfileNetworkContextService
       const base::FilePath& relative_partition_path,
       network::mojom::NetworkContextParams* network_context_params,
       cert_verifier::mojom::CertVerifierCreationParams*
-          cert_verifier_creation_params);
+          cert_verifier_creation_params,
+      const content::NetworkContextHandoffProof* proof = nullptr,
+      content::StoragePartition* participant = nullptr);
 
   // Returns the path for a given storage partition.
   base::FilePath GetPartitionPath(

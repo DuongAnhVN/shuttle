@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "chrome/browser/chrome_content_browser_client.h"
+#include "chrome/browser/shuttle/managed_network_admission.h"
 
 #include <algorithm>
 #include <iterator>
@@ -6106,6 +6107,25 @@ void ChromeContentBrowserClient::OnNetworkServiceCreated(
 
   SystemNetworkContextManager::OnNetworkServiceCreated(network_service,
                                                        local_state);
+}
+
+void ChromeContentBrowserClient::AwaitNetworkContextAdmission(
+    content::BrowserContext* context, base::OnceClosure admitted) {
+  shuttle::AwaitManagedNetworkAdmission(context, std::move(admitted));
+}
+
+bool ChromeContentBrowserClient::ConfigureNetworkContextParamsForHandoff(
+    content::BrowserContext* context, content::StoragePartition* participant,
+    const content::NetworkContextHandoffProof& proof, bool in_memory,
+    const base::FilePath& relative_partition_path,
+    network::mojom::NetworkContextParams* network_context_params,
+    cert_verifier::mojom::CertVerifierCreationParams* cert_verifier_creation_params) {
+  if (!proof.AuthorizesConfiguration(context, participant))
+    return false;
+  auto* service = ProfileNetworkContextServiceFactory::GetForContextIfExists(context);
+  return service && service->ConfigureNetworkContextParamsForHandoff(
+      participant, proof, in_memory, relative_partition_path,
+      network_context_params, cert_verifier_creation_params);
 }
 
 void ChromeContentBrowserClient::ConfigureNetworkContextParams(

@@ -2,17 +2,20 @@
 # smoke-all.sh: the owned smoke run. Launches <binary> with its own temp profile (--remote-debugging-port=0, port read
 # from DevToolsActivePort), runs the probes, closes the browser itself (Browser.close, bounded wait, kill -9 only of
 # the PID it started), checks the exit status and the log for fatals, removes its temp dir, prints PASS/FAIL/SKIP.
-# Usage: scripts/smoke-all.sh <binary|Shuttle.app> [--with network,push,automation] [--mode headless|x11|wayland]
+# Usage: scripts/smoke-all.sh <binary|Shuttle.app> [--with network,push,automation,profiles] [--mode headless|x11|wayland]
 #   Default: cdp, session-cdp, agents-page, isolation (agent storage across blank tabs), focus, sandbox (Linux only: the page is not built on macOS), mcp phase 1,
 #   restart on the same profile, mcp phase 2, tab-guards, page-tools (2x), throwaway, proxy, fingerprint-persona. Opt-in: network (own launch with --shuttle-listen=0.0.0.0, LAN),
 #   push (needs SHUTTLE_SMOKE_NET=1, else SKIP), automation (own launch: --enable-automation, no debug port; binds
 #   9222 when free, else a free port). x11/wayland use the WSLg defaults (DISPLAY=:0, /mnt/wslg/runtime-dir) unless
-#   set. Run it under nice -n 19 on a shared machine. Env: SHUTTLE_SMOKE_READY_S (startup deadline, default 30).
+#   set. profiles (own launch with --shuttle-isolated-profiles on a fresh profile: browser profiles, scoped routing, CDP
+#   ownership, persona on the wire, cookies; creates and deletes throwaway Chromium Profiles, never the startup one; the
+#   probes read <udd>/ShuttleManagerAdminToken). Run it under nice -n 19 on a shared machine. Env: SHUTTLE_SMOKE_READY_S
+#   (startup deadline, default 30).
 # Exit: 0 all passed, 1 a FAIL, 2 usage, 3 no FAIL but something skipped (open, not green).
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd -P)"
 G='FATAL|Check failed|DUMP_WILL_BE|Trying to access an unregistered pref|Trying to register KeyedService Factory|DanglingRawPtrDetected'
-usage() { echo "usage: smoke-all.sh <binary|Shuttle.app> [--with network,push,automation] [--mode headless|x11|wayland]" >&2; exit 2; }
+usage() { echo "usage: smoke-all.sh <binary|Shuttle.app> [--with network,push,automation,profiles] [--mode headless|x11|wayland]" >&2; exit 2; }
 [[ $# -ge 1 ]] || usage
 bin=${1%/}; shift; mode=headless; with=,
 while [[ $# -gt 0 ]]; do
@@ -21,18 +24,19 @@ while [[ $# -gt 0 ]]; do
   shift 2
 done
 [[ $mode =~ ^(headless|x11|wayland)$ ]] || usage
-for w in ${with//,/ }; do [[ $w =~ ^(network|push|automation)$ ]] || usage; done
+for w in ${with//,/ }; do [[ $w =~ ^(network|push|automation|profiles)$ ]] || usage; done
 exe=$bin; [[ $bin == *.app ]] && exe="$bin/Contents/MacOS/$(basename "$bin" .app)"
 [[ -f $exe && -x $exe ]] || { echo "not an executable: $exe" >&2; exit 2; }
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/shuttle-smoke.XXXXXX") || exit 2
-log="$tmp/browser.log"; pid=; port=; ready=; ec=; fail=0; open=0; results=()
+log="$tmp/browser.log"; pid=; port=; ready=; ec=; fail=0; open=0; results=(); udd=
 trap 'stop; rm -rf "$tmp"' EXIT; trap 'exit 130' INT TERM
 note() { results+=("$(printf '%-17s %s' "$1" "$2")"); case $2 in FAIL*) fail=1 ;; SKIP*) open=1 ;; esac; }
 to() { if command -v timeout >/dev/null; then timeout "$@"; else perl -e 'alarm shift; exec @ARGV or die "exec: $!"' "$@"; fi; }
 
 launch() {  # launch <profile> [args...]: start the browser in the background, wait until CDP answers
-  local prof=$1 a; shift
+  local prof=$1 a h; shift
+  udd=$prof
   rm -f "$prof/DevToolsActivePort"  # left over from the previous launch on the same profile
   a=(--user-data-dir="$prof" --no-first-run --no-default-browser-check --enable-logging=stderr "$@")
   [[ $(uname) == Darwin ]] && a+=(--use-mock-keychain)
@@ -49,7 +53,9 @@ launch() {  # launch <profile> [args...]: start the browser in the background, w
   while (( SECONDS < end )); do
     kill -0 "$pid" 2>/dev/null || { echo "browser exited during startup"; tail -5 "$log"; return 1; }
     port=$(head -1 "$prof/DevToolsActivePort" 2>/dev/null)
-    if [[ $port =~ ^[0-9]+$ ]] && curl -fsS -m 2 "http://127.0.0.1:$port/json/version" >/dev/null 2>&1; then
+    # With --shuttle-isolated-profiles /json/* needs the admin token (file in the udd; read here, never printed).
+    h=(); [[ -s $prof/ShuttleManagerAdminToken ]] && h=(-H "X-Shuttle-Admin-Token: $(tr -d '\r\n' < "$prof/ShuttleManagerAdminToken")")
+    if [[ $port =~ ^[0-9]+$ ]] && curl -fsS -m 2 ${h[@]+"${h[@]}"} "http://127.0.0.1:$port/json/version" >/dev/null 2>&1; then
       ready=1; echo "browser pid $pid, CDP port $port"; return 0
     fi
     sleep 0.5
@@ -59,9 +65,12 @@ launch() {  # launch <profile> [args...]: start the browser in the background, w
 stop() {  # close our own browser (only $pid, never by port), wait at most 30 s, then kill -9; sets ec
   [[ -n $pid ]] || return 0
   if [[ -n $ready ]] && kill -0 "$pid" 2>/dev/null; then
-    to 15 node -e 'fetch(`http://127.0.0.1:${process.argv[1]}/json/version`).then((r) => r.json()).then((v) => {
-      const w = new WebSocket(v.webSocketDebuggerUrl); w.onopen = () => w.send(JSON.stringify({ id: 1, method: "Browser.close" }));
-      w.onmessage = w.onclose = () => process.exit(0); })' "$port" >/dev/null 2>&1
+    # The admin token (isolated profiles) is read from the udd by node itself, so it never appears on a command line.
+    to 15 node -e 'let h = {}; try { h = { "X-Shuttle-Admin-Token": require("fs").readFileSync(process.argv[2] + "/ShuttleManagerAdminToken", "utf8").trim() }; } catch {}
+      fetch(`http://127.0.0.1:${process.argv[1]}/json/version`, { headers: h }).then((r) => r.json()).then((v) => {
+      const w = Object.keys(h).length ? new WebSocket(v.webSocketDebuggerUrl, { headers: h }) : new WebSocket(v.webSocketDebuggerUrl);
+      w.onopen = () => w.send(JSON.stringify({ id: 1, method: "Browser.close" }));
+      w.onmessage = w.onclose = () => process.exit(0); })' "$port" "$udd" >/dev/null 2>&1
     local end=$((SECONDS + 30))
     while kill -0 "$pid" 2>/dev/null && (( SECONDS < end )); do sleep 0.5; done
   fi
@@ -134,6 +143,19 @@ if [[ $with == *,network,* ]]; then
   if launch "$tmp/net" --remote-debugging-port=0 --shuttle-listen=0.0.0.0; then
     probe network 60 smoke-network.mjs "$tmp/net"; closed network
   else note launch-network FAIL; stop; fi
+fi
+# Isolated Chromium Profiles (opt-in): own launch on a fresh user-data-dir with --shuttle-isolated-profiles. Every probe
+# makes its own throwaway Profiles (and stops+deletes them), reads the admin token from <udd>, and skips (3) when the
+# browser does not report the capability. The legacy probes above run with the flag OFF and must stay green.
+if [[ $with == *,profiles,* ]]; then
+  if launch "$tmp/profiles" --remote-debugging-port=0 --shuttle-isolated-profiles; then
+    probe browser-profiles 120 smoke-browser-profiles.mjs "$tmp/profiles"
+    probe profile-routing 180 smoke-profile-routing.mjs "$tmp/profiles"
+    probe profile-cdp 180 smoke-profile-cdp.mjs "$tmp/profiles"
+    probe profile-network 180 smoke-profile-network.mjs "$tmp/profiles"
+    probe profile-cookies 180 smoke-profile-cookies.mjs "$tmp/profiles"
+    closed profiles
+  else note launch-profiles FAIL; stop; fi
 fi
 if [[ $with == *,automation,* ]]; then
   if launch "$tmp/auto" --enable-automation; then probe automation 60 check-automation.mjs "$tmp/auto"; closed automation

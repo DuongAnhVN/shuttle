@@ -215,6 +215,12 @@ class NET_EXPORT CookieMonster : public CookieStore {
   // See https://codereview.chromium.org/2882063002/#msg64.
   void SetAllCookiesAsync(const CookieList& list, SetCookiesCallback callback);
 
+  // Native storage handoff, NOT a web write or an import API. The caller must
+  // quiesce all clients. Replaces both maps after disk loading, without eviction
+  // or access/creation time rewriting. Invalid/duplicate input changes nothing.
+  void RestoreStorageSnapshotAsync(CookieList snapshot,
+                                   base::OnceCallback<void(bool)> callback);
+
   // CookieStore implementation.
   void SetCanonicalCookieAsync(
       std::unique_ptr<CanonicalCookie> cookie,
@@ -645,6 +651,8 @@ class NET_EXPORT CookieMonster : public CookieStore {
   // For data gathering purposes, this routine is treated as if it is
   // restoring saved cookies; some statistics are not gathered in this case.
   void SetAllCookies(CookieList list, SetCookiesCallback callback);
+  void RestoreStorageSnapshot(CookieList snapshot,
+                              base::OnceCallback<void(bool)> callback);
 
   void InternalUpdateCookieAccessTime(CanonicalCookie& cc,
                                       base::Time current_time);

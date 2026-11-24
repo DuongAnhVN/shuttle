@@ -1095,3 +1095,16 @@ if (!is_android) {
 if (is_linux || is_mac || is_win) {
 }
 
+
+# Shuttle: native tests of the isolated Chromium Profiles (registry state machine,
+# admin token, owner indexes, and the lifecycle/bootstrap browser test). The
+# desktop unit_tests/browser_tests aggregates are not part of this tree, so this
+# group only builds them; NOT YET COMPILED. See tools/shuttle/docs/PROFILES.md.
+if (!is_android) {
+  group("shuttle_profile_tests") {
+    testonly = true
+    deps = [
+      "//chrome/browser/shuttle:shuttle_profile_unittests",
+    ]
+  }
+}

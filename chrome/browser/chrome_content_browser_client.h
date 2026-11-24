@@ -723,6 +723,15 @@ class ChromeContentBrowserClient : public content::ContentBrowserClient {
       override;
   void OnNetworkServiceCreated(
       network::mojom::NetworkService* network_service) override;
+  bool ConfigureNetworkContextParamsForHandoff(
+      content::BrowserContext* context,
+      content::StoragePartition* participant,
+      const content::NetworkContextHandoffProof& proof,
+      bool in_memory,
+      const base::FilePath& relative_partition_path,
+      network::mojom::NetworkContextParams* network_context_params,
+      cert_verifier::mojom::CertVerifierCreationParams*
+          cert_verifier_creation_params) override;
   void ConfigureNetworkContextParams(
       content::BrowserContext* context,
       bool in_memory,
@@ -730,6 +739,8 @@ class ChromeContentBrowserClient : public content::ContentBrowserClient {
       network::mojom::NetworkContextParams* network_context_params,
       cert_verifier::mojom::CertVerifierCreationParams*
           cert_verifier_creation_params) override;
+  void AwaitNetworkContextAdmission(content::BrowserContext* context,
+                                    base::OnceClosure admitted) override;
   std::vector<base::FilePath> GetNetworkContextsParentDirectory() override;
   base::DictValue GetNetLogConstants() override;
   bool AllowRenderingMhtmlOverHttp(

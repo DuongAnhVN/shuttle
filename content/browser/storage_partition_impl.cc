@@ -3346,6 +3346,117 @@ void StoragePartitionImpl::ResetURLLoaderFactories() {
       ->Reset();
 }
 
+void StoragePartitionImpl::RetireNetworkContext(
+    base::OnceCallback<void(bool)> callback) {
+  // Stop execution, NOT registrations. Service worker factory bundles are not
+  // guaranteed to observe a scoped NetworkContext loss like a global crash.
+  GetServiceWorkerContext()->StopAllServiceWorkers(base::BindOnce(
+      &StoragePartitionImpl::RetireNetworkContextAfterWorkersStopped,
+      weak_factory_.GetWeakPtr(), std::move(callback)));
+}
+
+void StoragePartitionImpl::RetireNetworkContextAfterWorkersStopped(
+    base::OnceCallback<void(bool)> callback) {
+  DCHECK_CURRENTLY_ON(BrowserThread::UI);
+  CHECK(!network_context_retiring_);
+  // Every retirement invalidates deferred construction and suppresses BOTH
+  // reconnect sources, even when the private control pipe owns the context.
+  ++network_context_generation_;
+  if (network_context_owner_->network_context.is_bound())
+    network_context_owner_->network_context.set_disconnect_handler(base::DoNothing());
+  if (handoff_control_.is_bound())
+    handoff_control_.set_disconnect_handler(base::DoNothing());
+  if (handoff_state_->release_possible) {
+    std::move(callback).Run(false);
+    return;
+  }
+  handoff_attempt_ = base::UnguessableToken::Create();
+  if (handoff_rollback_pending_) {
+    std::move(callback).Run(false);
+    return;
+  }
+  if (handoff_state_->cookies &&
+      (!handoff_control_.is_bound() || !handoff_control_.is_connected())) {
+    if (handoff_lifetime_.is_bound()) {
+      AbortNetworkContextHandoff(base::BindOnce(
+          [](base::WeakPtr<StoragePartitionImpl> self,
+             base::OnceCallback<void(bool)> callback) {
+            if (!self) return;
+            self->handoff_restore_attempted_ = false;
+            std::move(callback).Run(true);
+          }, weak_factory_.GetWeakPtr(), std::move(callback)));
+      return;
+    }
+    // Retry the same authoritative snapshot, including acknowledged empty.
+    handoff_restored_ = false;
+    handoff_restore_attempted_ = false;
+    handoff_control_.reset();
+    std::move(callback).Run(true);
+    return;
+  }
+  if (network_context_retirement_failed_) {
+    // A service crash before the snapshot cannot certify preservation. Only
+    // browser restart can recover from the durable cookie store in this case.
+    std::move(callback).Run(false);
+    return;
+  }
+  if (!network_context_admitted_) {
+    // A deferred construction has no service-side context to retire. Preserve
+    // its pending pipe; it will be configured only after admission reopens.
+    InitNetworkContext();
+    std::move(callback).Run(true);
+    return;
+  }
+  network_context_retiring_ = true;
+  auto& context = handoff_control_.is_bound() && handoff_control_.is_connected()
+                      ? handoff_control_
+                      : network_context_owner_->network_context;
+  if (handoff_control_.is_bound())
+    handoff_control_.set_disconnect_handler(base::DoNothing());
+  // The primary receiver closes partway through destruction. A separate pipe
+  // closes only after the service-owned destructor returns; use that as fence.
+  context.set_disconnect_handler(base::DoNothing());
+  auto completion_receiver = retirement_completion_.BindNewPipeAndPassReceiver();
+  auto retired = base::BarrierClosure(2, base::BindOnce(
+      [](base::WeakPtr<StoragePartitionImpl> self,
+         base::OnceCallback<void(bool)> callback) {
+        if (!self) {
+          return;
+        }
+        self->network_context_retiring_ = false;
+        self->handoff_restore_attempted_ = false;
+        self->retirement_completion_.reset();
+        self->handoff_lifetime_.reset();
+        const bool success = self->handoff_state_->cookies.has_value();
+        self->network_context_retirement_failed_ = !success;
+        self->cookie_manager_for_browser_process_.reset();
+        self->network_context_client_receiver_.reset();
+        self->InitNetworkContext();
+        // Reset cached browser factories only AFTER old service-side factories
+        // died. IO Reset queues its replacement on the admission-blocked pipe;
+        // do not wait for that pipe while admission is closed.
+        self->shared_url_loader_factory_for_browser_process_->factory()->Reset();
+        self->shared_url_loader_factory_for_browser_process_
+            ->factory_for_io_thread()->Reset();
+        std::move(callback).Run(success);
+      }, weak_factory_.GetWeakPtr(), std::move(callback)));
+  retirement_completion_.set_disconnect_handler(retired);
+  context->Retire(
+      std::move(completion_receiver),
+      mojo::WrapCallbackWithDropHandler(
+          base::BindOnce(
+              [](base::WeakPtr<StoragePartitionImpl> self,
+                 base::RepeatingClosure retired,
+                 const std::vector<net::CanonicalCookie>& cookies) {
+                 if (self && !self->handoff_state_->cookies) {
+                   self->handoff_state_->cookies = cookies;
+                }
+                retired.Run();
+              },
+              weak_factory_.GetWeakPtr(), retired),
+          base::BindOnce(retired)));
+}
+
 void StoragePartitionImpl::ClearBluetoothAllowedDevicesMap() {
   CHECK_CURRENTLY_ON(BrowserThread::UI, base::NotFatalUntil::M159);
   CHECK(initialized_);
@@ -3547,14 +3658,93 @@ void StoragePartitionImpl::GetQuotaSettings(
 }
 
 void StoragePartitionImpl::InitNetworkContext() {
+  handoff_restored_ = false;
+  if (handoff_state_->release_possible && !handoff_state_->cookies) {
+    // Indeterminate teardown discarded a quarantined snapshot. Neither normal
+    // reconnect nor a later GetNetworkContext may turn that into safe recovery.
+    ++network_context_generation_;
+    handoff_control_.reset();
+    network_context_owner_->network_context.reset();
+    if (handoff_callback_)
+      std::move(handoff_callback_).Run(false);
+    return;
+  }
+  if (handoff_state_->cookies) {
+    // A crash during restore/registry persistence MUST NOT use normal recovery.
+    ++network_context_generation_;
+    handoff_control_.reset();
+    network_context_owner_->network_context.reset();
+    handoff_workload_ = network_context_owner_->network_context
+                            .BindNewPipeAndPassReceiver();
+    if (handoff_callback_)
+      std::move(handoff_callback_).Run(false);
+    return;
+  }
+  network_context_admitted_ = false;
+  const uint64_t generation = ++network_context_generation_;
+  network_context_owner_->network_context.reset();
+  auto receiver =
+      network_context_owner_->network_context.BindNewPipeAndPassReceiver();
+  cert_verifier_service_updater_.reset();
+  auto updater_receiver =
+      cert_verifier_service_updater_.BindNewPipeAndPassReceiver();
+  auto construct =
+      base::BindOnce(&StoragePartitionImpl::InitAdmittedNetworkContext,
+                    weak_factory_.GetWeakPtr(), generation, std::nullopt, std::move(receiver),
+                    std::move(updater_receiver));
+  GetContentClient()->browser()->AwaitNetworkContextAdmission(
+      browser_context_,
+      std::move(construct));
+}
+
+void StoragePartitionImpl::InitAdmittedNetworkContext(
+    uint64_t generation,
+    std::optional<NetworkContextHandoffProof> proof,
+    mojo::PendingReceiver<network::mojom::NetworkContext> receiver,
+    mojo::PendingReceiver<cert_verifier::mojom::CertVerifierServiceUpdater>
+        updater_receiver) {
+  if (generation != network_context_generation_) {
+    return;
+  }
+  const auto valid_staging = [&] {
+    return generation == network_context_generation_ && proof &&
+           proof->AuthorizesConfiguration(browser_context_, this) &&
+           proof->IsBoundTo(handoff_attempt_, generation) &&
+           handoff_state_->cookies.has_value() &&
+           !handoff_state_->release_possible && !network_context_retiring_ &&
+           !network_context_retirement_failed_ && !handoff_rollback_pending_ &&
+           handoff_restore_attempted_ && handoff_callback_ &&
+           !handoff_lifetime_.is_bound();
+  };
+  const auto fail_staging = [&] {
+    if (handoff_callback_)
+      std::move(handoff_callback_).Run(false);
+  };
+  if (proof && !valid_staging()) {
+    fail_staging();
+    return;
+  }
+  network_context_admitted_ = !proof;
   network::mojom::NetworkContextParamsPtr context_params =
       network::mojom::NetworkContextParams::New();
   cert_verifier::mojom::CertVerifierCreationParamsPtr
       cert_verifier_creation_params =
           cert_verifier::mojom::CertVerifierCreationParams::New();
-  GetContentClient()->browser()->ConfigureNetworkContextParams(
-      browser_context_, is_in_memory(), relative_partition_path_,
-      context_params.get(), cert_verifier_creation_params.get());
+  if (proof) {
+    if (!GetContentClient()->browser()->ConfigureNetworkContextParamsForHandoff(
+            browser_context_, this, *proof, is_in_memory(), relative_partition_path_,
+            context_params.get(), cert_verifier_creation_params.get())) {
+      fail_staging();
+      return;
+    }
+  } else {
+    GetContentClient()->browser()->ConfigureNetworkContextParams(
+        browser_context_, is_in_memory(), relative_partition_path_,
+        context_params.get(), cert_verifier_creation_params.get());
+  }
+  if (handoff_state_->cookies) {
+    context_params->initial_cookies = *handoff_state_->cookies;
+  }
   // Should be initialized with existing per-profile CORS access lists.
   DCHECK(context_params->cors_origin_access_list.empty())
       << "NetworkContextParams::cors_origin_access_list should be populated "
@@ -3570,10 +3760,9 @@ void StoragePartitionImpl::InitNetworkContext() {
          "NetworkContextParams, as they will be replaced with a new pipe to "
          "the CertVerifierService.";
 
-  cert_verifier_service_updater_.reset();
   context_params->cert_verifier_params = GetCertVerifierParamsWithUpdater(
       std::move(cert_verifier_creation_params),
-      cert_verifier_service_updater_.BindNewPipeAndPassReceiver());
+      std::move(updater_receiver));
 
   // This mechanisms should be used only for legacy internal headers. You can
   // find a recommended alternative approach on URLRequest::cors_exempt_headers
@@ -3623,10 +3812,24 @@ void StoragePartitionImpl::InitNetworkContext() {
   }
 #endif
 
-  network_context_owner_->network_context.reset();
+  if (proof && !valid_staging()) {
+    fail_staging();
+    return;
+  }
+  if (proof) {
+    context_params->handoff_member = network::mojom::StorageHandoffMember::New(
+        handoff_attempt_, generation);
+    handoff_workload_ = std::move(receiver);
+    handoff_control_.reset();
+    CHECK(!handoff_lifetime_.is_bound());
+    context_params->handoff_lifetime =
+        handoff_lifetime_.BindNewPipeAndPassReceiver();
+    receiver = handoff_control_.BindNewPipeAndPassReceiver();
+  }
   CreateNetworkContextInNetworkService(
-      network_context_owner_->network_context.BindNewPipeAndPassReceiver(),
+      std::move(receiver),
       std::move(context_params));
+  network_context_admitted_ = true;  // Constructed, not workload-admitted.
   CHECK(network_context_owner_->network_context, base::NotFatalUntil::M159);
 
   // Restore the saved network revocation nonces. This allows network access
@@ -3645,6 +3848,209 @@ void StoragePartitionImpl::InitNetworkContext() {
       network_context_client_receiver_.BindNewPipeAndPassRemote());
   network_context_owner_->network_context.set_disconnect_handler(base::BindOnce(
       &StoragePartitionImpl::InitNetworkContext, weak_factory_.GetWeakPtr()));
+  if (proof) {
+    handoff_control_.set_disconnect_handler(base::BindOnce(
+        &StoragePartitionImpl::InitNetworkContext, weak_factory_.GetWeakPtr()));
+    handoff_control_->AcknowledgeStorageHandoff(base::BindOnce(
+        [](base::WeakPtr<StoragePartitionImpl> self, uint64_t generation) {
+          if (!self || generation != self->network_context_generation_)
+            return;
+          self->handoff_restored_ = true;
+          if (self->handoff_callback_)
+            std::move(self->handoff_callback_).Run(true);
+        }, weak_factory_.GetWeakPtr(), generation));
+  }
+}
+
+std::shared_ptr<NetworkContextHandoffState>
+StoragePartitionImpl::GetNetworkContextHandoffState() const {
+  return handoff_state_;
+}
+
+std::shared_ptr<NetworkContextHandoffState>
+StoragePartitionImpl::BeginNetworkContextHandoffState() {
+  // Failed pre-release attempts share their authoritative generation for retry.
+  // A successful earlier generation must not be mutated by a new operation.
+  if (!handoff_state_->cookies && !handoff_state_->release_possible)
+    handoff_state_ = std::make_shared<NetworkContextHandoffState>();
+  return handoff_state_;
+}
+
+void StoragePartitionImpl::StageNetworkContextHandoff(
+    NetworkContextHandoffProof proof,
+    base::OnceCallback<void(bool)> callback) {
+  if (!proof.IsValidFor(browser_context_, this) ||
+      network_context_retiring_ || handoff_state_->release_possible ||
+      handoff_attempt_.is_empty() || network_context_retirement_failed_ ||
+      handoff_callback_ || handoff_rollback_pending_ || handoff_lifetime_.is_bound()) {
+    std::move(callback).Run(false);
+    return;
+  }
+  if (!proof.Bind(handoff_attempt_, network_context_generation_ + 1)) {
+    std::move(callback).Run(false);
+    return;
+  }
+  if (!handoff_state_->cookies) {
+    std::move(callback).Run(!network_context_retirement_failed_);
+    return;
+  }
+  if (handoff_restore_attempted_) {
+    std::move(callback).Run(false);
+    return;
+  }
+  handoff_callback_ = std::move(callback);
+  handoff_restore_attempted_ = true;
+  ++network_context_generation_;
+  cert_verifier_service_updater_.reset();
+  InitAdmittedNetworkContext(network_context_generation_, std::move(proof),
+      std::move(handoff_workload_),
+      cert_verifier_service_updater_.BindNewPipeAndPassReceiver());
+}
+
+void StoragePartitionImpl::FenceNetworkContextHandoff(
+    base::OnceCallback<void(bool)> callback) {
+  if (handoff_callback_ || handoff_rollback_pending_ ||
+      network_context_retiring_ || handoff_state_->release_possible) {
+    std::move(callback).Run(false);
+    return;
+  }
+  if (IsNetworkContextHandoffRestored() && handoff_state_->cookies) {
+    // A second call is the post-persistence fence, not a second restore. Its
+    // reply is ordered on the same generation's private service pipe.
+    handoff_callback_ = std::move(callback);
+    handoff_control_->AcknowledgeStorageHandoff(base::BindOnce(
+        [](base::WeakPtr<StoragePartitionImpl> self, uint64_t generation) {
+          if (!self || generation != self->network_context_generation_)
+            return;
+          if (self->handoff_callback_)
+            std::move(self->handoff_callback_).Run(true);
+        }, weak_factory_.GetWeakPtr(), network_context_generation_));
+    return;
+  }
+  if (!handoff_state_->cookies) {
+    std::move(callback).Run(!network_context_retirement_failed_);
+    return;
+  }
+  std::move(callback).Run(false);
+}
+
+network::mojom::StorageHandoffMemberPtr
+StoragePartitionImpl::GetNetworkContextHandoffConstructionMember() const {
+  return network::mojom::StorageHandoffMember::New(
+      handoff_attempt_, network_context_generation_ + 1);
+}
+
+bool StoragePartitionImpl::IsNetworkContextHandoffRestored() const {
+  if (!handoff_state_->cookies)
+    return !network_context_retirement_failed_;
+  return handoff_restored_ && handoff_control_.is_bound() &&
+         handoff_control_.is_connected();
+}
+
+network::mojom::StorageHandoffMemberPtr
+StoragePartitionImpl::GetNetworkContextHandoffMember() const {
+  if (!handoff_state_->cookies)
+    return nullptr;
+  return network::mojom::StorageHandoffMember::New(
+      handoff_attempt_, network_context_generation_);
+}
+
+void StoragePartitionImpl::SetNetworkContextHandoffTransaction(
+    const base::UnguessableToken& transaction) {
+  handoff_transaction_ = transaction;
+}
+
+void StoragePartitionImpl::SetNetworkContextHandoffReleasePossible(bool possible) {
+  handoff_state_->release_possible = possible;
+}
+
+void StoragePartitionImpl::ActivateNetworkContextHandoff(
+    base::OnceCallback<void(bool)> callback) {
+  if (!handoff_state_->cookies) {
+    std::move(callback).Run(!network_context_retirement_failed_);
+    return;
+  }
+  if (!IsNetworkContextHandoffRestored() || handoff_callback_) {
+    std::move(callback).Run(false);
+    return;
+  }
+  handoff_callback_ = std::move(callback);
+  handoff_control_->PrepareStorageHandoff(handoff_transaction_,
+      GetNetworkContextHandoffMember(), std::move(handoff_workload_),
+      base::BindOnce([](base::WeakPtr<StoragePartitionImpl> self,
+                         uint64_t generation, bool prepared) {
+        if (!self || self->network_context_generation_ != generation)
+          return;
+        // Only this generation can acknowledge preparation; workload is still
+        // unbound until every partition has acknowledged.
+        // Retain the snapshot until the browser's all-partition finalization.
+        if (self->handoff_callback_)
+          std::move(self->handoff_callback_).Run(prepared);
+      }, weak_factory_.GetWeakPtr(), network_context_generation_));
+}
+
+void StoragePartitionImpl::FinalizeNetworkContextHandoff(bool success) {
+  if (!handoff_state_->cookies)
+    return;
+  if (success) {
+    handoff_state_->cookies.reset();
+    handoff_state_->release_possible = false;
+    handoff_restored_ = false;
+    // Keep the service destructor fence until this generation is retired (or
+    // explicitly torn down after a later lifecycle failure). The snapshot is
+    // gone; ordinary acknowledged-release recovery uses the current store.
+  } else {
+    // Close the owning control receiver, destroying service-side factories and
+    // clones even if this partition activated before a sibling failed. Keep the
+    // authoritative snapshot for explicit retry under compensated pending intent.
+    InitNetworkContext();
+  }
+}
+
+void StoragePartitionImpl::AbortNetworkContextHandoff(base::OnceClosure callback) {
+  if (handoff_rollback_pending_) {
+    handoff_rollback_waiters_.push_back(std::move(callback));
+    return;
+  }
+  if (!handoff_state_->cookies && !handoff_lifetime_.is_bound()) {
+    std::move(callback).Run();
+    return;
+  }
+  handoff_rollback_waiters_.push_back(std::move(callback));
+  handoff_rollback_pending_ = true;
+  // Invalidate callbacks but retain the authoritative snapshot and lifetime
+  // fence. Closing the control pipe is NOT itself destruction acknowledgement.
+  ++network_context_generation_;
+  handoff_restored_ = false;
+  auto destroyed = base::BindOnce(
+      [](base::WeakPtr<StoragePartitionImpl> self) {
+        if (!self) return;
+        self->handoff_lifetime_.reset();
+        if (self->handoff_state_->release_possible) {
+          // The release reply was lost: requests may already have changed the
+          // store. Quarantine is permanent for this browser operation. Never
+          // restore this snapshot or offer a safe retry.
+          self->handoff_state_->cookies.reset();
+          self->network_context_retirement_failed_ = true;
+        }
+        self->handoff_rollback_pending_ = false;
+        // Explicit retirement alone authorizes retry, never a stale fence.
+        self->handoff_restore_attempted_ = true;
+        if (!self->handoff_state_->release_possible)
+          self->InitNetworkContext();
+        // An aborted prepare/restore must settle its barrier even when the
+        // quarantined path deliberately does not call InitNetworkContext.
+        auto pending = std::move(self->handoff_callback_);
+        auto waiters = std::move(self->handoff_rollback_waiters_);
+        if (pending) std::move(pending).Run(false);
+        for (auto& waiter : waiters) std::move(waiter).Run();
+      }, weak_factory_.GetWeakPtr());
+  if (handoff_lifetime_.is_bound()) {
+    handoff_lifetime_.set_disconnect_handler(std::move(destroyed));
+    handoff_control_.reset();
+  } else {
+    std::move(destroyed).Run();
+  }
 }
 
 network::mojom::URLLoaderFactoryParamsPtr

@@ -50,9 +50,11 @@ const ms = Number(process.env.SHUTTLE_SMOKE_DEADLINE_MS || 120_000);
 setTimeout(() => fail(`deadline: probe ran longer than ${ms} ms`), ms).unref();
 
 // CDP client: send(method, params, sessionId, ms = CALL_MS) resolves with the whole reply ({result} or {error}); other messages land in events.
-export function cdp(url) {
+// `headers` (optional, e.g. X-Shuttle-Admin-Token) goes on the upgrade request (undici WebSocket `{headers}`).
+// A refused upgrade rejects with `ws error <url>`; the HTTP status is not observable from a WebSocket, so use wsStatus() for it.
+export function cdp(url, headers) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url);
+    const ws = headers && Object.keys(headers).length ? new WebSocket(url, { headers }) : new WebSocket(url);
     const pending = new Map(), events = [];
     let id = 0;
     const t = setTimeout(() => { ws.close(); reject(new Error(`connect timeout ${url}`)); }, CALL_MS);
@@ -73,12 +75,31 @@ export function cdp(url) {
     };
   });
 }
-export const json = async (path) => {
-  const r = await fetch(base + path, { signal: AbortSignal.timeout(CALL_MS) });
+export const json = async (path, headers = {}) => {
+  const r = await fetch(base + path, { signal: AbortSignal.timeout(CALL_MS), headers });
   if (!r.ok) throw new Error(`GET ${path}: HTTP ${r.status}`);
   return r.json();
 };
-export const browserWs = async () => (await json('/json/version')).webSocketDebuggerUrl;
+export const browserWs = async (headers = {}) => (await json('/json/version', headers)).webSocketDebuggerUrl;
+// HTTP status of a plain GET (never throws on status); used for the 403/404 decisions made before a WebSocket upgrade.
+export const httpStatus = async (path, headers = {}) =>
+  (await fetch(/^https?:/.test(path) ? path : base + path, { signal: AbortSignal.timeout(CALL_MS), headers })).status;
+// The status the server answers to a WebSocket upgrade attempt: a denied connection is an HTTP 403/404 before accept. An
+// upgrade request cannot be replayed by fetch, so this speaks HTTP/1.1 itself.
+export async function wsStatus(url, headers = {}) {
+  const { connect } = await import('node:net');
+  const u = new URL(url);
+  return new Promise((resolve, reject) => {
+    const s = connect(Number(u.port), u.hostname);
+    const t = setTimeout(() => { s.destroy(); reject(new Error(`upgrade timeout ${u.pathname}`)); }, CALL_MS);
+    let buf = '';
+    s.on('connect', () => s.write([`GET ${u.pathname}${u.search} HTTP/1.1`, `Host: ${u.host}`, 'Upgrade: websocket', 'Connection: Upgrade',
+      'Sec-WebSocket-Key: c21va2Utc21va2Utc21va2U=', 'Sec-WebSocket-Version: 13',
+      ...Object.entries(headers).map(([k, v]) => `${k}: ${v}`), '', ''].join('\r\n')));
+    s.on('data', (d) => { buf += d; const m = buf.match(/^HTTP\/1\.1 (\d+)/); if (m) { clearTimeout(t); s.destroy(); resolve(Number(m[1])); } });
+    s.on('error', (e) => { clearTimeout(t); reject(e); });
+  });
+}
 export const evaluate = async (client, sessionId, expression) =>
   (await client.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, sessionId)).result?.result?.value;
 

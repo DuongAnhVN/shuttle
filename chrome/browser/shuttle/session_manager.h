@@ -19,6 +19,7 @@
 #include "base/time/time.h"
 #include "base/types/expected.h"
 #include "build/build_config.h"
+#include "chrome/browser/shuttle/browser_owner_index.h"
 #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
 #include "components/tab_groups/tab_group_id.h"
 #include "ui/gfx/geometry/size.h"
@@ -63,6 +64,10 @@ struct Session {
   base::TimeDelta idle_timeout;
   // MCP tool calls in flight (BeginWork/EndWork).
   int pending_calls = 0;
+  // Isolated Profiles on (--shuttle-isolated-profiles): who owns the session
+  // ({Profile key, agent, lifecycle epoch, browser epoch}); the same tuple is
+  // in the browser-wide SessionOwnerIndex under `id`. Unset in legacy mode.
+  std::optional<OwnerTuple> owner;
 };
 
 // Browser-wide default idle timeout of MCP sessions:
@@ -83,9 +88,23 @@ class SessionManager : public TabStripModelObserver {
   // `idle_timeout`: zero = never; nullopt = no timeout either (sessions the
   // browser opens for the user: chrome://agents "Open tab", a tab handed to
   // an agent). MCP's open-session passes DefaultSessionIdleTimeout().
-  const Session& Open(const std::string& agent_id,
+  //
+  // With isolated Profiles on, the id is a browser-wide UUIDv4 from the shared
+  // SessionOwnerIndex, the session is registered under its owner tuple and gets
+  // a per-session bearer grant (scope_auth.h). Returns nullptr (nothing
+  // opened) when the Profile is not `ready` (stopped, draining, failed) or is
+  // neither the startup Profile nor a managed one: admission is closed.
+  // Never nullptr in legacy mode.
+  const Session* Open(const std::string& agent_id,
                       std::optional<base::TimeDelta> idle_timeout =
                           std::nullopt);
+  // Isolated Profiles on: the owner tuple a new session of `agent_id` would
+  // have right now, or nullopt when this Profile does not currently accept
+  // work (not ready, stopped, draining, unmanaged). Always nullopt in legacy
+  // mode.
+  std::optional<OwnerTuple> CurrentOwner(const std::string& agent_id) const;
+  // Isolated Profiles on and this Profile no longer accepts work.
+  bool AdmissionClosed() const;
   // Records activity. No-op for unknown sessions.
   void Touch(const std::string& session_id);
   // An MCP tool call for the session is running: the session doesn't idle
@@ -118,6 +137,30 @@ class SessionManager : public TabStripModelObserver {
     session_closed_callback_ = std::move(callback);
   }
   void CloseProfileSessions(const std::string& agent_id);
+  // Closes every session (and so every leased tab, grant and scoped CDP
+  // connection) of this Profile: the drain of a Profile stop.
+  void CloseAllSessions();
+  // Any session, leased tab or scoped CDP connection still exists.
+  bool HasHandles() const;
+
+  // Scoped CDP connections (filters) of this Profile, for HasHandles().
+  void OnConnectionOpened() { ++open_connections_; }
+  void OnConnectionClosed() {
+    if (open_connections_ > 0) {
+      --open_connections_;
+    }
+  }
+  // `callback(session_id)` runs after a session closed (the filters of its
+  // connections end theirs). Returns an id for RemoveSessionEndCallback();
+  // callers bind weak pointers, so a callback outliving its owner is a no-op.
+  using SessionEndCallback =
+      base::RepeatingCallback<void(const std::string& session_id)>;
+  int AddSessionEndCallback(SessionEndCallback callback) {
+    const int id = ++last_end_callback_id_;
+    session_end_callbacks_[id] = std::move(callback);
+    return id;
+  }
+  void RemoveSessionEndCallback(int id) { session_end_callbacks_.erase(id); }
 
   // Re-applies the agent's name and color to its tab group (and repaints it,
   // for the avatar).
@@ -209,6 +252,10 @@ class SessionManager : public TabStripModelObserver {
 
  private:
   void Lease(content::WebContents* contents, const std::string& session_id);
+  // Isolated Profiles on: records the leased tab in the browser-wide target
+  // index under its session's owner tuple and partition.
+  void RegisterTarget(content::WebContents* contents,
+                      const std::string& session_id);
   void AddToSessionGroup(base::WeakPtr<content::WebContents> contents,
                          const std::string& session_id);
 
@@ -260,6 +307,9 @@ class SessionManager : public TabStripModelObserver {
   std::unique_ptr<ScopedProfileKeepAlive> sessions_profile_keep_alive_;
 #endif
   SessionClosedCallback session_closed_callback_;
+  std::map<int, SessionEndCallback> session_end_callbacks_;
+  int last_end_callback_id_ = 0;
+  int open_connections_ = 0;
   // Agent id -> its tab group. Created with the agent's first tab (a tab
   // group can't be empty); gone once its last tab closes.
   std::map<std::string, tab_groups::TabGroupId> groups_;

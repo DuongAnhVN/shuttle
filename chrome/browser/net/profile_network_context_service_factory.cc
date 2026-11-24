@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "chrome/browser/net/profile_network_context_service_factory.h"
+#include "base/check.h"
 
 #include "build/build_config.h"
 #include "build/chromeos_buildflags.h"
@@ -11,6 +12,7 @@
 #include "chrome/browser/net/profile_network_context_service.h"
 #include "chrome/browser/profiles/profile.h"
 #include "chrome/browser/shuttle/profile_persona_service_factory.h"
+#include "chrome/browser/shuttle/managed_network_admission.h"
 #include "chrome/browser/shuttle/profile_proxy_service_factory.h"
 #include "chrome/browser/ssl/sct_reporting_service_factory.h"
 #include "chrome/browser/webid/federated_identity_permission_context_factory.h"
@@ -38,6 +40,13 @@
 #if BUILDFLAG(ENTERPRISE_PROXY)
 #include "chrome/browser/enterprise/net/enterprise_proxy_service_factory.h"
 #endif
+
+ProfileNetworkContextService*
+ProfileNetworkContextServiceFactory::GetForContextIfExists(
+    content::BrowserContext* browser_context) {
+  return static_cast<ProfileNetworkContextService*>(
+      GetInstance()->GetServiceForBrowserContext(browser_context, false));
+}
 
 ProfileNetworkContextService*
 ProfileNetworkContextServiceFactory::GetForContext(
@@ -101,6 +110,7 @@ ProfileNetworkContextServiceFactory::~ProfileNetworkContextServiceFactory() =
 std::unique_ptr<KeyedService>
 ProfileNetworkContextServiceFactory::BuildServiceInstanceForBrowserContext(
     content::BrowserContext* profile) const {
+  CHECK(shuttle::ManagedNetworkAdmissionReady(profile));
   return std::make_unique<ProfileNetworkContextService>(
       Profile::FromBrowserContext(profile));
 }

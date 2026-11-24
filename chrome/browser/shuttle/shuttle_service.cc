@@ -19,12 +19,17 @@
 #include "base/strings/strcat.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/string_util.h"
+#include "base/task/single_thread_task_runner.h"
 #include "base/values.h"
 #include "base/version_info/version_info.h"
 #include "chrome/browser/shuttle/shuttle_service_factory.h"
 #include "chrome/browser/shuttle/avatar_cache.h"
+#include "chrome/browser/shuttle/browser_profile_registry.h"
+#include "chrome/browser/shuttle/browser_profile_router.h"
+#include "chrome/browser/shuttle/scope_auth.h"
 #include "chrome/browser/shuttle/mcp_tools.h"
 #include "chrome/browser/shuttle/page_tools.h"
+#include "chrome/browser/shuttle/persona_runtime.h"
 #include "chrome/browser/shuttle/profile_registry.h"
 #include "chrome/browser/shuttle/proxy_tab_sync.h"
 #include "chrome/browser/shuttle/session_cdp_filter.h"
@@ -108,9 +113,24 @@ base::DictValue InitializeResult(const base::DictValue* params) {
       .Set("instructions", kInstructions);
 }
 
-base::DictValue ToolsListResult() {
+// `admin`: the caller presented the admin credential. The admin-only browser
+// tools are listed only to an admin of a browser with isolated profiles on.
+base::DictValue ToolsListResult(bool admin) {
   base::ListValue tools;
   for (const Tool& tool : GetTools()) {
+    std::optional<base::DictValue> schema =
+        base::JSONReader::ReadDict(tool.input_schema, base::JSON_PARSE_RFC);
+    CHECK(schema) << "Bad input schema for " << tool.name;
+    tools.Append(base::DictValue()
+                     .Set("name", tool.name)
+                     .Set("description", tool.description)
+                     .Set("inputSchema", std::move(*schema)));
+  }
+  const bool isolated = BrowserProfileRouter::Get() != nullptr;
+  for (const BrowserTool& tool : GetBrowserTools()) {
+    if (tool.admin_only && !(admin && isolated)) {
+      continue;
+    }
     std::optional<base::DictValue> schema =
         base::JSONReader::ReadDict(tool.input_schema, base::JSON_PARSE_RFC);
     CHECK(schema) << "Bad input schema for " << tool.name;
@@ -124,6 +144,143 @@ base::DictValue ToolsListResult() {
   }
   return base::DictValue().Set("tools", std::move(tools));
 }
+
+// A contract error as a tools/call result (HTTP 200).
+void ReplyProfileFailure(const base::Value& id,
+                         const BrowserProfileFailure& failure,
+                         ShuttleService::HttpResponseCallback callback) {
+  std::move(callback).Run(
+      kHttpOk, kJson,
+      ResultMessage(id, ToolResult::ProfileFailure(failure).ToValue()));
+}
+
+// Runs a browser-level tool. Authorization comes first: a selector is
+// rejected, an admin-only tool needs the admin credential (and isolated
+// profiles on), whatever the arguments are.
+void RunBrowserTool(const BrowserTool& tool,
+                    bool admin,
+                    const base::DictValue* params,
+                    const base::Value& id,
+                    ShuttleService::HttpResponseCallback callback) {
+  if (ParseProfileSelector(params).has_selector_key) {
+    ReplyProfileFailure(
+        id,
+        BrowserProfileFailure(
+            BrowserProfileError::kInvalidProfileKey,
+            "A browser-level tool takes no profile selector."),
+        std::move(callback));
+    return;
+  }
+  if (tool.admin_only) {
+    if (!BrowserProfileRouter::Get()) {
+      ReplyProfileFailure(
+          id, BrowserProfileFailure(BrowserProfileError::kUnsupported),
+          std::move(callback));
+      return;
+    }
+    if (!admin) {
+      ReplyProfileFailure(
+          id, BrowserProfileFailure(BrowserProfileError::kForbidden),
+          std::move(callback));
+      return;
+    }
+  }
+  const base::Value* arguments = params ? params->Find("arguments") : nullptr;
+  if (arguments && !arguments->is_dict()) {
+    std::move(callback).Run(
+        kHttpOk, kJson,
+        ResultMessage(id, ToolResult::ProfileFailure(BrowserProfileFailure(
+                                 BrowserProfileError::kProfileFailed,
+                                 "Unexpected or malformed arguments."))
+                              .ToValue()));
+    return;
+  }
+  const base::DictValue empty_arguments;
+  tool.run(arguments ? arguments->GetDict() : empty_arguments,
+           base::BindOnce(
+               [](base::Value id,
+                  ShuttleService::HttpResponseCallback callback,
+                  ToolResult result) {
+                 std::move(callback).Run(
+                     kHttpOk, kJson,
+                     ResultMessage(id, std::move(result).ToValue()));
+               },
+               id.Clone(), std::move(callback)));
+}
+
+// Scoped `set-fingerprint` (admin, selector present). The persona of a managed
+// Profile is replaced only while it is `stopped` (PROFILES.md section 7), and a
+// stopped Profile cannot be resolved (profile_not_ready for every other tool),
+// so this tool never goes through Resolve(): the router replaces the persisted
+// persona intent without loading the Profile. Ready or any other state is
+// profile_busy / profile_not_ready, never a live change.
+void ReplaceManagedPersona(BrowserProfileRouter* router,
+                           const std::string& key,
+                           const base::DictValue* params,
+                           const base::Value& id,
+                           ShuttleService::HttpResponseCallback callback) {
+  const base::DictValue* arguments = params ? params->FindDict("arguments") : nullptr;
+  if (!arguments || arguments->size() != 1 || !arguments->contains("fingerprint")) {
+    ReplyProfileFailure(
+        id,
+        BrowserProfileFailure(BrowserProfileError::kProfileFailed,
+                              "Unexpected or malformed arguments."),
+        std::move(callback));
+    return;
+  }
+  const base::Value* fingerprint = arguments->Find("fingerprint");
+  if (fingerprint->is_none()) {
+    ReplyProfileFailure(
+        id,
+        BrowserProfileFailure(
+            BrowserProfileError::kPersonaInvalid,
+            "The persona of a managed profile cannot be cleared."),
+        std::move(callback));
+    return;
+  }
+  const base::DictValue* persona = fingerprint->GetIfDict();
+  const base::Value* timezone = persona ? persona->Find("timezone") : nullptr;
+  if (!persona || !persona->contains("preset") ||
+      (timezone && (!timezone->is_string() ||
+                    !IsKnownTimezoneId(timezone->GetString())))) {
+    ReplyProfileFailure(
+        id,
+        BrowserProfileFailure(
+            BrowserProfileError::kPersonaInvalid,
+            "A managed profile's persona is replaced by a full persona "
+            "(preset required) with a known time zone."),
+        std::move(callback));
+    return;
+  }
+  std::string persona_json = base::WriteJson(*persona).value_or(std::string());
+  router->ReplacePersona(
+      key, std::move(persona_json),
+      base::BindOnce(
+          [](base::Value id, ShuttleService::HttpResponseCallback callback,
+             base::expected<ProfileRecord, BrowserProfileFailure> result) {
+            if (!result.has_value()) {
+              ReplyProfileFailure(id, result.error(), std::move(callback));
+              return;
+            }
+            const base::DictValue record = result->ToValue();
+            base::Value summary;
+            if (const base::Value* value = record.Find("personaSummary")) {
+              summary = value->Clone();
+            }
+            std::move(callback).Run(
+                kHttpOk, kJson,
+                ResultMessage(
+                    id, ToolResult::Json(base::Value(base::DictValue().Set(
+                                             "fingerprint", std::move(summary))))
+                            .ToValue()));
+          },
+          id.Clone(), std::move(callback)));
+}
+
+// A Profile drain waits this long for sidecars and connections to go (the
+// router reports drain_timeout earlier; this only bounds a stuck drain).
+constexpr base::TimeDelta kDrainWait = base::Minutes(2);
+constexpr base::TimeDelta kDrainPollInterval = base::Milliseconds(100);
 
 constexpr size_t kDefaultMaxThrowawayAgents = 50;
 constexpr base::TimeDelta kThrowawayCheckInterval = base::Seconds(10);
@@ -198,9 +355,107 @@ ShuttleService* ShuttleService::Get(Profile* profile) {
   return ShuttleServiceFactory::GetForProfile(profile);
 }
 
-void ShuttleService::HandleMcpRequest(const std::string& host,
+// static
+void ShuttleService::HandleHttpMcpRequest(Profile* legacy_profile,
+                                          const std::string& host,
                                           const std::string& body,
+                                          bool admin,
                                           HttpResponseCallback callback) {
+  BrowserProfileRouter* router = BrowserProfileRouter::Get();
+  std::optional<base::Value> parsed =
+      base::JSONReader::Read(body, base::JSON_PARSE_RFC);
+  const base::DictValue* message =
+      parsed && parsed->is_dict() ? &parsed->GetDict() : nullptr;
+  const std::string* method = message ? message->FindString("method") : nullptr;
+  const base::Value* id = message ? message->Find("id") : nullptr;
+  const base::DictValue* params = message ? message->FindDict("params") : nullptr;
+  // Only a request (method and id) can carry a scope; anything else is
+  // answered by the service of the default Profile, as before.
+  const bool is_call = method && id && *method == "tools/call";
+  const std::string* name =
+      is_call && params ? params->FindString("name") : nullptr;
+
+  if (name) {
+    if (const BrowserTool* tool = FindBrowserTool(*name)) {
+      RunBrowserTool(*tool, admin, params, *id, std::move(callback));
+      return;
+    }
+  }
+
+  // Which Profile serves the request: authorized and resolved before any
+  // session is touched.
+  Profile* profile = nullptr;
+  std::optional<std::string> selector;
+  if (is_call) {
+    const ParsedSelector parsed_selector = ParseProfileSelector(params);
+    if (parsed_selector.state == SelectorState::kMalformed) {
+      ReplyProfileFailure(
+          *id, BrowserProfileFailure(BrowserProfileError::kInvalidProfileKey),
+          std::move(callback));
+      return;
+    }
+    if (parsed_selector.state == SelectorState::kPresent) {
+      if (!router) {
+        // Never a silent fallback to the legacy Profile.
+        ReplyProfileFailure(
+            *id, BrowserProfileFailure(BrowserProfileError::kUnsupported),
+            std::move(callback));
+        return;
+      }
+      if (!admin) {
+        // A selector grants no authority.
+        ReplyProfileFailure(
+            *id, BrowserProfileFailure(BrowserProfileError::kForbidden),
+            std::move(callback));
+        return;
+      }
+      selector = parsed_selector.key;
+    }
+  }
+  if (selector && name && *name == "set-fingerprint") {
+    // Admin and a well-formed selector are established above. The only tool
+    // that may address a stopped Profile.
+    ReplaceManagedPersona(router, *selector, params, *id, std::move(callback));
+    return;
+  }
+  if (router) {
+    // The startup Profile (no selector) or the named one; never the
+    // last-used Profile.
+    base::expected<ResolvedProfile, BrowserProfileFailure> resolved =
+        router->Resolve(selector);
+    if (!resolved.has_value()) {
+      if (selector && id) {
+        ReplyProfileFailure(*id, resolved.error(), std::move(callback));
+      } else {
+        std::move(callback).Run(503, "text/plain",
+                                "Shuttle is still starting up.");
+      }
+      return;
+    }
+    profile = resolved->profile;
+  } else {
+    profile = legacy_profile;
+  }
+  ShuttleService* service =
+      profile ? ShuttleService::Get(profile->GetOriginalProfile()) : nullptr;
+  if (!service) {
+    if (selector && id) {
+      ReplyProfileFailure(
+          *id, BrowserProfileFailure(BrowserProfileError::kProfileNotReady),
+          std::move(callback));
+    } else {
+      std::move(callback).Run(503, "text/plain",
+                              "Shuttle is still starting up.");
+    }
+    return;
+  }
+  service->HandleMcpRequest(host, body, std::move(callback), admin);
+}
+
+void ShuttleService::HandleMcpRequest(const std::string& host,
+                                      const std::string& body,
+                                      HttpResponseCallback callback,
+                                      bool admin) {
   const base::Value null_id;
   std::optional<base::Value> parsed =
       base::JSONReader::Read(body, base::JSON_PARSE_RFC);
@@ -243,7 +498,7 @@ void ShuttleService::HandleMcpRequest(const std::string& host,
   }
   if (*method == "tools/list") {
     std::move(callback).Run(kHttpOk, kJson,
-                            ResultMessage(*id, ToolsListResult()));
+                            ResultMessage(*id, ToolsListResult(admin)));
     return;
   }
   if (*method != "tools/call") {
@@ -434,8 +689,12 @@ std::string ShuttleService::TouchSessionOf(
   std::string working;
   if (const std::string* target_id = arguments.FindString("targetId")) {
     if (content::WebContents* contents = SessionManager::FindTab(*target_id)) {
-      working = SessionManager::SessionOf(contents);
-      sessions_->Touch(working);
+      // Target ids are browser-wide: only a session of this service counts.
+      const std::string leased = SessionManager::SessionOf(contents);
+      if (sessions_->Get(leased)) {
+        working = leased;
+        sessions_->Touch(working);
+      }
     }
   }
   if (const std::string* session_id = arguments.FindString("sessionId")) {
@@ -462,6 +721,59 @@ void ShuttleService::Shutdown() {
   throwaway_timer_.Stop();
   profiles_->FlushAllCookies();
   page_tools_->Shutdown();
+}
+
+std::unique_ptr<content::DevToolsManagerDelegate::ConnectionFilter>
+ShuttleService::CreateScopedConnectionFilter(const std::string& session_id,
+                                             const std::string& page_target_id,
+                                             const OwnerTuple& owner) {
+  const Session* session = sessions_->Get(session_id);
+  if (!session || !session->owner || !(*session->owner == owner)) {
+    return nullptr;
+  }
+  FilterScope scope;
+  scope.owner = owner;
+  scope.browser_context_id = profile_->UniqueId();
+  return std::make_unique<SessionCdpFilter>(
+      sessions_->GetWeakPtr(), session_id,
+      /*page_connection=*/!page_target_id.empty(), page_target_id,
+      std::move(scope));
+}
+
+bool ShuttleService::HasDescendantHandles() const {
+  return sessions_->HasHandles() || page_tools_->HasLiveSidecars();
+}
+
+void ShuttleService::Drain(base::OnceCallback<void(bool success)> done) {
+  // Sessions first: closing one discards its tabs, revokes its grant and
+  // target entries, ends its scoped connections and closes its sidecar.
+  sessions_->CloseAllSessions();
+  // Throwaway agents live and die with the browser run; their idle timer must
+  // not delete them mid-drain.
+  throwaway_timer_.Stop();
+  profiles_->FlushAllCookies();
+  WaitForDrained(std::move(done), base::TimeTicks::Now() + kDrainWait);
+}
+
+void ShuttleService::WaitForDrained(base::OnceCallback<void(bool success)> done,
+                                    base::TimeTicks deadline) {
+  if (!HasDescendantHandles()) {
+    UpdateThrowawayTimer();
+    std::move(done).Run(true);
+    return;
+  }
+  if (base::TimeTicks::Now() >= deadline) {
+    // The router keeps the Profile `draining` and reports drain_timeout (never
+    // `failed`, never `stopped` with live handles); a later stop resumes this
+    // drain and re-checks the handles before it can reach `stopped`.
+    std::move(done).Run(false);
+    return;
+  }
+  base::SingleThreadTaskRunner::GetCurrentDefault()->PostDelayedTask(
+      FROM_HERE,
+      base::BindOnce(&ShuttleService::WaitForDrained,
+                     weak_factory_.GetWeakPtr(), std::move(done), deadline),
+      kDrainPollInterval);
 }
 
 std::unique_ptr<content::DevToolsManagerDelegate::ConnectionFilter>

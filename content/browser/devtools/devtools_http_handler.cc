@@ -151,21 +151,21 @@ bool IsLoopbackPeer(const net::HttpServerRequestInfo& info) {
   return address.IsValid() && address.IsLoopback();
 }
 
-// Removes token=<value> from the path's query and returns the value (empty if
-// absent), so the token never reaches the request handlers (e.g. as the URL of
-// /json/new?<url>).
-std::string TakeTokenParam(std::string& path) {
+// Removes <name>=<value> from the path's query and returns the value (empty if
+// absent), so the credential never reaches the request handlers (e.g. as the
+// URL of /json/new?<url>). `name` includes the '=' ("token=").
+std::string TakeQueryParam(std::string& path, std::string_view name_with_eq) {
   size_t query_position = path.find('?');
   if (query_position == std::string::npos) {
     return std::string();
   }
-  std::string token;
+  std::string value;
   std::vector<std::string> kept;
   for (const std::string& part :
        base::SplitString(std::string_view(path).substr(query_position + 1),
                          "&", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL)) {
-    if (base::StartsWith(part, "token=", base::CompareCase::SENSITIVE)) {
-      token = part.substr(strlen("token="));
+    if (base::StartsWith(part, name_with_eq, base::CompareCase::SENSITIVE)) {
+      value = part.substr(name_with_eq.size());
     } else {
       kept.push_back(part);
     }
@@ -174,7 +174,33 @@ std::string TakeTokenParam(std::string& path) {
   if (!kept.empty()) {
     path += "?" + base::JoinString(kept, "&");
   }
-  return token;
+  return value;
+}
+
+std::string TakeTokenParam(std::string& path) {
+  return TakeQueryParam(path, "token=");
+}
+
+// Shuttle isolated Profiles: the headers that carry request authority. The
+// HTTP server lowercases header names. The admin token is accepted from its
+// header only (never from the URL); the session grant also from the `grant`
+// query parameter, which CheckAccess() moves into the header slot.
+constexpr char kAdminTokenHeaderLower[] = "x-shuttle-admin-token";
+constexpr char kSessionGrantHeaderLower[] = "x-shuttle-session-grant";
+
+DevToolsManagerDelegate::RequestContext MakeRequestContext(
+    DevToolsManagerDelegate* delegate,
+    const net::HttpServerRequestInfo& info) {
+  DevToolsManagerDelegate::RequestContext context;
+  auto token = info.headers.find(kAdminTokenHeaderLower);
+  if (delegate && token != info.headers.end() && !token->second.empty()) {
+    context.admin = delegate->VerifyAdminToken(token->second);
+  }
+  auto grant = info.headers.find(kSessionGrantHeaderLower);
+  if (grant != info.headers.end()) {
+    context.session_grant = grant->second;
+  }
+  return context;
 }
 
 bool TokenMatches(std::string_view presented, const std::string& expected) {
@@ -257,6 +283,13 @@ ServerWrapper::ServerWrapper(base::WeakPtr<DevToolsHttpHandler> handler,
 bool ServerWrapper::CheckAccess(int connection_id,
                                 net::HttpServerRequestInfo& info) {
   std::string query_token = TakeTokenParam(info.path);
+  // Shuttle: a scoped endpoint's per-session grant travels as ?grant=<g>; it
+  // is stripped from the path (session ids and /json/new URLs never see it)
+  // and handed to the UI thread in the grant header slot of this copy.
+  std::string query_grant = TakeQueryParam(info.path, "grant=");
+  if (!query_grant.empty()) {
+    info.headers[kSessionGrantHeaderLower] = std::move(query_grant);
+  }
   if (!access_token_.empty() && !IsLoopbackPeer(info)) {
     // Network mode: a remote client is served only with the access token.
     // The token also replaces the Host check, so LAN and Tailscale host
@@ -453,6 +486,9 @@ class DevToolsAgentHostClientImpl : public DevToolsAgentHostClient {
                               weak_factory_.GetWeakPtr()),
           base::BindRepeating(&DevToolsAgentHostClientImpl::SendToClient,
                               weak_factory_.GetWeakPtr()));
+      filter_->SetCloseCallback(
+          base::BindRepeating(&DevToolsAgentHostClientImpl::CloseConnection,
+                              weak_factory_.GetWeakPtr()));
     }
     // TODO(dgozman): handle return value of AttachClient.
     agent_host_->AttachClient(this);
@@ -510,6 +546,15 @@ class DevToolsAgentHostClientImpl : public DevToolsAgentHostClient {
   }
 
  private:
+  // Shuttle: a filter whose authority was revoked ends the connection (the
+  // same close AgentHostClosed() posts).
+  void CloseConnection() {
+    task_runner_->PostTask(
+        FROM_HERE,
+        base::BindOnce(&ServerWrapper::Close, base::Unretained(server_wrapper_),
+                       connection_id_));
+  }
+
   void SendToClient(std::string message) {
     task_runner_->PostTask(
         FROM_HERE,
@@ -631,7 +676,7 @@ void ServerWrapper::OnHttpRequest(int connection_id,
     // Discovery page request.
     GetUIThreadTaskRunner({})->PostTask(
         FROM_HERE, base::BindOnce(&DevToolsHttpHandler::OnDiscoveryPageRequest,
-                                  handler_, connection_id));
+                                  handler_, connection_id, info));
     return;
   }
 
@@ -739,6 +784,15 @@ void DevToolsHttpHandler::OnJsonRequest(
   if (mode_ ==
       DevToolsAgentHost::RemoteDebuggingServerMode::kWithApprovalOnly) {
     Send404(connection_id);
+    return;
+  }
+  // Shuttle: with isolated Profiles on, browser-global discovery (and
+  // /json/new, activate, close) is an admin operation.
+  if (delegate_ &&
+      !delegate_->AllowBrowserGlobalHttp(
+          MakeRequestContext(delegate_, info))) {
+    Send403(connection_id,
+            "Shuttle: browser-wide endpoints need the admin credential.");
     return;
   }
   // Trim /json
@@ -941,6 +995,7 @@ void DevToolsHttpHandler::OnMcpRequest(
   auto host = info.headers.find("host");
   delegate_->HandleMcpRequest(
       host != info.headers.end() ? host->second : std::string(), info.data,
+      MakeRequestContext(delegate_, info),
       base::BindOnce(&DevToolsHttpHandler::SendMcpResponse,
                      weak_factory_.GetWeakPtr(), connection_id));
 }
@@ -964,10 +1019,21 @@ void DevToolsHttpHandler::SendMcpResponse(int connection_id,
                                 connection_id, response));
 }
 
-void DevToolsHttpHandler::OnDiscoveryPageRequest(int connection_id) {
+void DevToolsHttpHandler::OnDiscoveryPageRequest(
+    int connection_id,
+    const net::HttpServerRequestInfo& info) {
   if (mode_ ==
       DevToolsAgentHost::RemoteDebuggingServerMode::kWithApprovalOnly) {
     Send404(connection_id);
+    return;
+  }
+  // Shuttle: the discovery page is browser-global like /json/*; with isolated
+  // Profiles on it needs the admin credential too.
+  if (delegate_ &&
+      !delegate_->AllowBrowserGlobalHttp(
+          MakeRequestContext(delegate_, info))) {
+    Send403(connection_id,
+            "Shuttle: browser-wide endpoints need the admin credential.");
     return;
   }
   net::HttpServerResponseInfo response(net::HTTP_OK);
@@ -1044,11 +1110,41 @@ void DevToolsHttpHandler::OnWebSocketRequest(
     return;
   }
 
+  // Shuttle: every socket gets an explicit ConnectionDecision from the
+  // delegate (admin-allowed, scoped filter or denied). A null filter never
+  // means "unfiltered": raw access exists only as kAdminAllowed, and a
+  // missing delegate denies.
+  using Decision = DevToolsManagerDelegate::ConnectionDecision;
+  using Kind = DevToolsManagerDelegate::ConnectionKind;
+  const DevToolsManagerDelegate::RequestContext context =
+      MakeRequestContext(delegate_, request);
+  auto decide = [&](Kind kind, const std::string& session_id,
+                    const std::string& target_id) {
+    return delegate_
+               ? delegate_->DecideConnection(kind, session_id, target_id,
+                                             context)
+               : Decision::Denied(403);
+  };
+  // 404: unknown or stale owner; 403: not authorized.
+  auto reject = [&](const Decision& decision) {
+    if (decision.kind == Decision::Kind::kDenied &&
+        decision.http_status == 404) {
+      Send404(connection_id);
+    } else {
+      Send403(connection_id, "Connection rejected");
+    }
+  };
+
   // If we require user approval, we do not require guid.
   if (mode_ ==
       DevToolsAgentHost::RemoteDebuggingServerMode::kWithApprovalOnly) {
     if (base::StartsWith(request.path, kBrowserUrlPrefix,
                          base::CompareCase::SENSITIVE)) {
+      Decision decision = decide(Kind::kBrowser, std::string(), std::string());
+      if (decision.kind != Decision::Kind::kAdminAllowed) {
+        reject(decision);
+        return;
+      }
       delegate_->AcceptDebugging(
           base::BindOnce(&DevToolsHttpHandler::HandleDebuggingApproval,
                          weak_factory_.GetWeakPtr(), connection_id, request));
@@ -1061,29 +1157,10 @@ void DevToolsHttpHandler::OnWebSocketRequest(
 
   if (base::StartsWith(request.path, browser_guid_,
                        base::CompareCase::SENSITIVE)) {
-    scoped_refptr<DevToolsAgentHost> browser_agent =
-        DevToolsAgentHost::CreateForBrowser(
-            thread_->task_runner(),
-            base::BindRepeating(&DevToolsSocketFactory::CreateForTethering,
-                                base::Unretained(socket_factory_.get())));
-    connection_to_client_[connection_id] =
-        std::make_unique<DevToolsAgentHostClientImpl>(
-            thread_->task_runner(), server_wrapper_.get(), connection_id,
-            browser_agent, request.peer);
-    AcceptWebSocket(connection_id, request);
-    return;
-  }
-
-  // Shuttle: /devtools/session/<id> is a browser-level connection that
-  // only sees the session's tabs (the delegate's filter enforces it).
-  if (base::StartsWith(request.path, kSessionUrlPrefix,
-                       base::CompareCase::SENSITIVE)) {
-    std::string session_id = request.path.substr(strlen(kSessionUrlPrefix));
-    std::unique_ptr<DevToolsManagerDelegate::ConnectionFilter> filter =
-        delegate_ ? delegate_->CreateConnectionFilter(session_id, "")
-                  : nullptr;
-    if (!filter) {
-      Send404(connection_id);
+    Decision decision = decide(Kind::kBrowser, std::string(), std::string());
+    if (decision.kind == Decision::Kind::kDenied ||
+        (decision.kind == Decision::Kind::kScopedFilter && !decision.filter)) {
+      reject(decision);
       return;
     }
     scoped_refptr<DevToolsAgentHost> browser_agent =
@@ -1094,7 +1171,35 @@ void DevToolsHttpHandler::OnWebSocketRequest(
     connection_to_client_[connection_id] =
         std::make_unique<DevToolsAgentHostClientImpl>(
             thread_->task_runner(), server_wrapper_.get(), connection_id,
-            browser_agent, request.peer, std::move(filter));
+            browser_agent, request.peer,
+            decision.kind == Decision::Kind::kScopedFilter
+                ? std::move(decision.filter)
+                : nullptr);
+    AcceptWebSocket(connection_id, request);
+    return;
+  }
+
+  // Shuttle: /devtools/session/<id> is a browser-level connection that
+  // only sees the session's tabs (the delegate's filter enforces it).
+  if (base::StartsWith(request.path, kSessionUrlPrefix,
+                       base::CompareCase::SENSITIVE)) {
+    std::string session_id = request.path.substr(strlen(kSessionUrlPrefix));
+    Decision decision = decide(Kind::kSession, session_id, std::string());
+    // A session socket is always filtered: an admin decision is not valid
+    // here.
+    if (decision.kind != Decision::Kind::kScopedFilter || !decision.filter) {
+      reject(decision);
+      return;
+    }
+    scoped_refptr<DevToolsAgentHost> browser_agent =
+        DevToolsAgentHost::CreateForBrowser(
+            thread_->task_runner(),
+            base::BindRepeating(&DevToolsSocketFactory::CreateForTethering,
+                                base::Unretained(socket_factory_.get())));
+    connection_to_client_[connection_id] =
+        std::make_unique<DevToolsAgentHostClientImpl>(
+            thread_->task_runner(), server_wrapper_.get(), connection_id,
+            browser_agent, request.peer, std::move(decision.filter));
     AcceptWebSocket(connection_id, request);
     return;
   }
@@ -1106,6 +1211,12 @@ void DevToolsHttpHandler::OnWebSocketRequest(
   }
 
   std::string target_id = request.path.substr(strlen(kPageUrlPrefix));
+  Decision decision = decide(Kind::kPage, std::string(), target_id);
+  if (decision.kind == Decision::Kind::kDenied ||
+      (decision.kind == Decision::Kind::kScopedFilter && !decision.filter)) {
+    reject(decision);
+    return;
+  }
   scoped_refptr<DevToolsAgentHost> agent =
       DevToolsAgentHost::GetForId(target_id);
   if (!agent) {
@@ -1124,8 +1235,9 @@ void DevToolsHttpHandler::OnWebSocketRequest(
       std::make_unique<DevToolsAgentHostClientImpl>(
           thread_->task_runner(), server_wrapper_.get(), connection_id, agent,
           request.peer,
-          delegate_ ? delegate_->CreateConnectionFilter("", target_id)
-                    : nullptr);
+          decision.kind == Decision::Kind::kScopedFilter
+              ? std::move(decision.filter)
+              : nullptr);
 
   AcceptWebSocket(connection_id, request);
 }

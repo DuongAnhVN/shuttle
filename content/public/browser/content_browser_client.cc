@@ -1210,6 +1210,20 @@ ContentBrowserClient::URLLoaderRequestHandler ContentBrowserClient::
 void ContentBrowserClient::OnNetworkServiceCreated(
     network::mojom::NetworkService* network_service) {}
 
+void ContentBrowserClient::AwaitNetworkContextAdmission(
+    BrowserContext* context, base::OnceClosure admitted) {
+  std::move(admitted).Run();
+}
+
+bool ContentBrowserClient::ConfigureNetworkContextParamsForHandoff(
+    BrowserContext* context, StoragePartition* participant,
+    const NetworkContextHandoffProof& proof, bool in_memory,
+    const base::FilePath& relative_partition_path,
+    network::mojom::NetworkContextParams* network_context_params,
+    cert_verifier::mojom::CertVerifierCreationParams* cert_verifier_creation_params) {
+  return false;
+}
+
 void ContentBrowserClient::ConfigureNetworkContextParams(
     BrowserContext* context,
     bool in_memory,

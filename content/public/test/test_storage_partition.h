@@ -57,6 +57,9 @@ class TestStoragePartition : public StoragePartition {
   TestStoragePartition& operator=(const TestStoragePartition&) = delete;
 
   ~TestStoragePartition() override;
+  void StageNetworkContextHandoff(NetworkContextHandoffProof proof,
+                                 base::OnceCallback<void(bool)> callback) override;
+  void FenceNetworkContextHandoff(base::OnceCallback<void(bool)> callback) override;
 
   void set_config(StoragePartitionConfig config) { config_ = config; }
   const StoragePartitionConfig& GetConfig() const override;
@@ -226,6 +229,7 @@ class TestStoragePartition : public StoragePartition {
   void Flush() override;
 
   void ResetURLLoaderFactories() override;
+  void RetireNetworkContext(base::OnceCallback<void(bool)> callback) override;
   void ClearBluetoothAllowedDevicesMap() override;
 
   void AddObserver(DataRemovalObserver* observer) override;

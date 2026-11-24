@@ -17,6 +17,7 @@
 #include "base/timer/timer.h"
 #include "base/types/expected.h"
 #include "base/values.h"
+#include "chrome/browser/shuttle/browser_owner_index.h"
 #include "chrome/browser/shuttle/profile_registry.h"
 #include "components/keyed_service/core/keyed_service.h"
 #include "content/public/browser/devtools_manager_delegate.h"
@@ -56,17 +57,53 @@ class ShuttleService : public KeyedService {
   // Returns the service of `profile`, or nullptr for profiles without one.
   static ShuttleService* Get(Profile* profile);
 
-  // Handles one JSON-RPC message POSTed to /mcp.
+  // Entry point of POST /mcp (ChromeDevToolsManagerDelegate::HandleMcpRequest).
+  // Authorizes and routes BEFORE any session is touched:
+  //  - browser-level tools (get-capabilities, create/list/load/stop/delete-
+  //    browser-profile) are answered here; the admin ones need `admin`
+  //    (forbidden otherwise, unsupported when isolated profiles are off) and
+  //    reject a `_meta["shuttle/profileId"]` selector;
+  //  - a profile-scoped tools/call is routed to the ShuttleService of the
+  //    Profile the selector names (invalid_profile_key / profile_not_found /
+  //    profile_not_ready, never a fallback); a selector needs `admin`; without
+  //    one the request runs in the fixed startup Profile the router captured;
+  //  - with isolated profiles off nothing changes: `legacy_profile` (the
+  //    last-used loaded Profile, as before) serves every request, and a
+  //    selector is `unsupported`.
+  static void HandleHttpMcpRequest(Profile* legacy_profile,
+                                   const std::string& host,
+                                   const std::string& body,
+                                   bool admin,
+                                   HttpResponseCallback callback);
+
+  // Handles one JSON-RPC message POSTed to /mcp for this service's Profile.
+  // `admin` only decides which tools tools/list shows.
   void HandleMcpRequest(const std::string& host,
                         const std::string& body,
-                        HttpResponseCallback callback);
+                        HttpResponseCallback callback,
+                        bool admin = false);
 
   // A filter scoping a CDP connection to an agent session, or nullptr:
   // /devtools/session/<session_id> (nullptr if unknown), or a page connection
-  // to `target_id` (nullptr unless it is a leased tab).
+  // to `target_id` (nullptr unless it is a leased tab). Legacy mode only.
   std::unique_ptr<content::DevToolsManagerDelegate::ConnectionFilter>
   CreateConnectionFilter(const std::string& session_id,
                          const std::string& target_id);
+  // Isolated profiles on: the mandatory filter of a scoped session or page
+  // connection of `owner` (nullptr if the session is gone or owned by another
+  // tuple). Empty `page_target_id` = the session's browser-level socket.
+  std::unique_ptr<content::DevToolsManagerDelegate::ConnectionFilter>
+  CreateScopedConnectionFilter(const std::string& session_id,
+                               const std::string& page_target_id,
+                               const OwnerTuple& owner);
+
+  // Isolated profiles on: any session, leased tab, worker (sidecar) or scoped
+  // connection of this Profile still exists.
+  bool HasDescendantHandles() const;
+  // Drains this Profile's work (the Profile stop): closes every session (tabs,
+  // grants, scoped connections), flushes agent cookies and waits until the
+  // sidecars and connections are gone. `done(false)` after a bounded wait.
+  void Drain(base::OnceCallback<void(bool success)> done);
 
   // For the tab strip UI, which only sees this header: agents as tab
   // groups.
@@ -113,6 +150,8 @@ class ShuttleService : public KeyedService {
   // (`targetId`) count as the session's activity. Returns the session the
   // call works for (the `sessionId` one first), empty if none.
   std::string TouchSessionOf(const base::DictValue& arguments);
+  void WaitForDrained(base::OnceCallback<void(bool success)> done,
+                      base::TimeTicks deadline);
   // Deletes throwaway agents idle past their timeout; runs while any exist.
   void CheckThrowaways();
   void UpdateThrowawayTimer();

@@ -41,6 +41,19 @@ inline constexpr char kFingerprintPersona[] = "shuttle.fingerprint_persona";
 // is profile-level. ProfilePersonaService deletes the leftovers at startup.
 inline constexpr char kLegacyAgentFingerprintPersona[] = "fingerprint_persona";
 
+// Profile-level marker of a managed (isolated) Chromium Profile
+// (managed_profile_bootstrap.h, tools/shuttle/docs/PROFILES.md section 6):
+// {version: 1, core_profile_key: "bp_<32 hex>"}. Written by the bootstrap
+// together with the committed persona and the workspace agent entry, through
+// PrefService, in ProfileImpl::OnPrefsLoaded. Its presence means "this Profile
+// has an isolated identity": a missing or corrupt persona is then a failure,
+// never a stock fallback. Absent = legacy/unmanaged Profile, whose semantics
+// are unchanged. Registered by ProfilePersonaServiceFactory.
+inline constexpr char kManagedProfile[] = "shuttle.managed_profile";
+inline constexpr char kManagedProfileVersionKey[] = "version";
+inline constexpr char kManagedProfileKeyKey[] = "core_profile_key";
+inline constexpr int kManagedProfileVersion = 1;
+
 // List of deleted profile ids whose storage still has to be removed from
 // disk (the partition was loaded when the profile was deleted).
 inline constexpr char kPendingDeletes[] = "shuttle.pending_deletes";

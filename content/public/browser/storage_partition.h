@@ -7,20 +7,28 @@
 
 #include <stdint.h>
 
+#include <memory>
+#include <optional>
 #include <set>
+#include <vector>
 
 #include "base/functional/callback_forward.h"
+#include "base/functional/callback.h"
+#include "base/memory/raw_ptr.h"
 #include "base/observer_list_types.h"
 #include "base/time/time.h"
+#include "base/unguessable_token.h"
 #include "build/build_config.h"
 #include "components/services/storage/privileged/mojom/indexed_db_control.mojom-forward.h"
 #include "components/services/storage/public/mojom/cache_storage_control.mojom-forward.h"
 #include "components/services/storage/public/mojom/local_storage_control.mojom-forward.h"
 #include "content/common/content_export.h"
 #include "media/media_buildflags.h"
+#include "net/cookies/canonical_cookie.h"
 #include "services/network/public/cpp/shared_url_loader_factory.h"
 #include "services/network/public/mojom/cert_verifier_service_updater.mojom-forward.h"
 #include "services/network/public/mojom/cookie_manager.mojom-forward.h"
+#include "services/network/public/mojom/network_context.mojom.h"
 #include "services/network/public/mojom/restricted_cookie_manager.mojom-forward.h"
 #include "services/network/public/mojom/trust_tokens.mojom-forward.h"
 
@@ -63,7 +71,56 @@ namespace url {
 class Origin;
 }  // namespace url
 
+namespace shuttle {
+class BrowserProfileRouter;
+}
+
 namespace content {
+
+class BrowserContext;
+class StoragePartition;
+class StoragePartitionImpl;
+
+// Browser-process-only construction authority. Never transported over Mojo.
+// Only the lifecycle router can mint it; moving invalidates the source.
+class CONTENT_EXPORT NetworkContextHandoffProof {
+ public:
+  NetworkContextHandoffProof(NetworkContextHandoffProof&&);
+  NetworkContextHandoffProof& operator=(NetworkContextHandoffProof&&);
+  ~NetworkContextHandoffProof();
+  NetworkContextHandoffProof(const NetworkContextHandoffProof&) = delete;
+  NetworkContextHandoffProof& operator=(const NetworkContextHandoffProof&) = delete;
+  bool IsValidFor(BrowserContext* context, StoragePartition* participant) const;
+  bool AuthorizesConfiguration(BrowserContext* context,
+                               StoragePartition* participant) const;
+
+ private:
+  friend class shuttle::BrowserProfileRouter;
+  friend class StoragePartitionImpl;
+  NetworkContextHandoffProof(BrowserContext* context,
+                            StoragePartition* participant,
+                            const base::UnguessableToken& attempt,
+                            uint64_t generation,
+                            base::RepeatingCallback<bool()> owns_handoff);
+  bool Bind(const base::UnguessableToken& attempt, uint64_t generation);
+  bool IsBoundTo(const base::UnguessableToken& attempt,
+                 uint64_t generation) const;
+  raw_ptr<BrowserContext> context_ = nullptr;
+  raw_ptr<StoragePartition> participant_ = nullptr;
+  base::RepeatingCallback<bool()> owns_handoff_;
+  base::UnguessableToken attempt_;
+  uint64_t generation_ = 0;
+  bool bound_ = false;
+};
+
+// Browser-only authoritative generation state. The router operation retains a
+// strong reference through teardown/compensation; partitions merely share that
+// state. Absence is not an acknowledged empty snapshot. Never serialize this as
+// provider cookies: canonical metadata and session state must remain intact.
+struct CONTENT_EXPORT NetworkContextHandoffState {
+  std::optional<std::vector<net::CanonicalCookie>> cookies;
+  bool release_possible = false;
+};
 
 class BackgroundSyncContext;
 class BrowserContext;
@@ -337,6 +394,35 @@ class CONTENT_EXPORT StoragePartition {
 
   // Resets all URLLoaderFactories bound to this partition's network context.
   virtual void ResetURLLoaderFactories() = 0;
+
+  // After client drain, retire only this partition's existing NetworkContext
+  // and every dependent factory/clone. Cookies are handed to its replacement;
+  // non-network storage is untouched. Caller must close construction admission
+  // until callback, commit identity, then reopen it. Does not initialize an
+  // unused context. False means no acknowledged cookie handoff; stay closed.
+  virtual void RetireNetworkContext(base::OnceCallback<void(bool)> callback) = 0;
+  // Defaults: no handoff state, nothing staged, nothing to restore. Partitions
+  // that take part in a handoff override them.
+  virtual std::shared_ptr<NetworkContextHandoffState>
+  GetNetworkContextHandoffState() const;
+  virtual std::shared_ptr<NetworkContextHandoffState>
+  BeginNetworkContextHandoffState();
+  virtual void StageNetworkContextHandoff(
+      NetworkContextHandoffProof proof,
+      base::OnceCallback<void(bool)> callback);
+  virtual void FenceNetworkContextHandoff(base::OnceCallback<void(bool)> callback);
+  virtual network::mojom::StorageHandoffMemberPtr
+  GetNetworkContextHandoffConstructionMember() const;
+  virtual bool IsNetworkContextHandoffRestored() const;
+  virtual network::mojom::StorageHandoffMemberPtr
+  GetNetworkContextHandoffMember() const;
+  virtual void SetNetworkContextHandoffTransaction(
+      const base::UnguessableToken& transaction);
+  virtual void SetNetworkContextHandoffReleasePossible(bool possible);
+  virtual void ActivateNetworkContextHandoff(
+      base::OnceCallback<void(bool)> callback);
+  virtual void FinalizeNetworkContextHandoff(bool success);
+  virtual void AbortNetworkContextHandoff(base::OnceClosure callback);
 
   // Clears the bluetooth allowed devices map.
   virtual void ClearBluetoothAllowedDevicesMap() = 0;

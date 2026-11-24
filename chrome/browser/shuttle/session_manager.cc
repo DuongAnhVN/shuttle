@@ -25,7 +25,9 @@
 #include "chrome/browser/headless/headless_mode_util.h"
 #include "chrome/browser/lifetime/browser_shutdown.h"
 #include "chrome/browser/shuttle/home_tab_manager.h"
+#include "chrome/browser/shuttle/browser_profile_router.h"
 #include "chrome/browser/shuttle/profile_registry.h"
+#include "chrome/browser/shuttle/scope_auth.h"
 #include "chrome/browser/shuttle/switches.h"
 #include "chrome/browser/profiles/keep_alive/profile_keep_alive_types.h"
 #include "chrome/browser/profiles/keep_alive/scoped_profile_keep_alive.h"
@@ -123,9 +125,20 @@ class ViewportEmulator : public content::DevToolsAgentHostClient {
 class AgentTabLease : public content::WebContentsUserData<AgentTabLease>,
                       public content::WebContentsObserver {
  public:
-  ~AgentTabLease() override = default;
+  ~AgentTabLease() override {
+    // Isolated Profiles on: the target leaves the browser-wide index with its
+    // lease (the router is gone at shutdown: nothing to update then).
+    if (!target_id_.empty()) {
+      if (BrowserProfileRouter* router = BrowserProfileRouter::Get()) {
+        router->target_owners().Remove(target_id_);
+      }
+    }
+  }
 
   const std::string& session_id() const { return session_id_; }
+  void set_target_id(std::string target_id) {
+    target_id_ = std::move(target_id);
+  }
   const std::optional<gfx::Size>& viewport() const { return viewport_; }
   void set_viewport(const gfx::Size& size) {
     viewport_ = size;
@@ -179,6 +192,8 @@ class AgentTabLease : public content::WebContentsUserData<AgentTabLease>,
                                                   /*is_activity=*/false)) {}
 
   std::string session_id_;
+  // The CDP target id the lease registered in the target index ("" if none).
+  std::string target_id_;
   base::WeakPtr<SessionManager> manager_;
   base::ScopedClosureRunner capture_;
   std::optional<gfx::Size> viewport_;
@@ -307,12 +322,53 @@ SessionManager::SessionManager(Profile* profile, ProfileRegistry* registry)
 
 SessionManager::~SessionManager() = default;
 
-const Session& SessionManager::Open(
+std::optional<OwnerTuple> SessionManager::CurrentOwner(
+    const std::string& agent_id) const {
+  BrowserProfileRouter* router = BrowserProfileRouter::Get();
+  if (!router) {
+    return std::nullopt;
+  }
+  // Never GetLastUsedProfile(): this Profile is either a ready managed one
+  // (its key) or the startup Profile the router captured, nothing else.
+  const std::string key = router->KeyOfProfile(profile_);
+  base::expected<ResolvedProfile, BrowserProfileFailure> resolved =
+      router->Resolve(key.empty() ? std::nullopt
+                                  : std::optional<std::string>(key));
+  if (!resolved.has_value() || resolved->profile != profile_) {
+    return std::nullopt;
+  }
+  OwnerTuple owner = router->MakeOwner(*resolved, agent_id);
+  // The partition is the agent the session works for (a managed Profile's
+  // workspace agent is only the default one).
+  owner.workspace_agent = agent_id;
+  return owner;
+}
+
+bool SessionManager::AdmissionClosed() const {
+  BrowserProfileRouter* router = BrowserProfileRouter::Get();
+  if (!router) {
+    return false;
+  }
+  return !CurrentOwner(std::string()).has_value();
+}
+
+const Session* SessionManager::Open(
     const std::string& agent_id,
     std::optional<base::TimeDelta> idle_timeout) {
-  std::string id = NewSessionId();
-  while (sessions_.contains(id)) {
+  std::string id;
+  std::optional<OwnerTuple> owner;
+  if (BrowserProfileRouter* router = BrowserProfileRouter::Get()) {
+    owner = CurrentOwner(agent_id);
+    if (!owner) {
+      return nullptr;
+    }
+    // Browser-wide UUIDv4, collision-checked against every Profile's sessions.
+    id = router->session_owners().RegisterNew(*owner);
+  } else {
     id = NewSessionId();
+    while (sessions_.contains(id)) {
+      id = NewSessionId();
+    }
   }
   Session& session = sessions_[id];
   session.id = id;
@@ -321,11 +377,17 @@ const Session& SessionManager::Open(
   session.last_activity = session.opened;
   session.last_activity_ticks = base::TimeTicks::Now();
   session.idle_timeout = idle_timeout.value_or(base::TimeDelta());
+  session.owner = owner;
+  if (owner) {
+    // The scoped endpoints of this session carry this grant, never the admin
+    // token (revoked in Close()).
+    SessionGrants::Get().Issue(id, *owner);
+  }
   UpdateIdleTimer();
 #if BUILDFLAG(IS_LINUX)
   UpdateKeepAlive();
 #endif
-  return session;
+  return &session;
 }
 
 void SessionManager::Touch(const std::string& session_id) {
@@ -529,6 +591,20 @@ bool SessionManager::Close(const std::string& session_id) {
   if (session_closed_callback_) {
     session_closed_callback_.Run(session_id);
   }
+  // Isolated Profiles on: the handle, its grant and its targets are revoked,
+  // and the scoped CDP connections of the session end.
+  SessionGrants::Get().Revoke(session_id);
+  if (BrowserProfileRouter* router = BrowserProfileRouter::Get()) {
+    router->session_owners().Remove(session_id);
+    router->target_owners().RemoveAllForSession(session_id);
+  }
+  if (!session_end_callbacks_.empty()) {
+    // Copied: a callback may remove itself (a filter closing its connection).
+    const std::map<int, SessionEndCallback> callbacks = session_end_callbacks_;
+    for (const auto& [callback_id, callback] : callbacks) {
+      callback.Run(session_id);
+    }
+  }
 #if BUILDFLAG(IS_LINUX)
   // Last: releasing the keep-alive can start shutdown (no windows left).
   UpdateKeepAlive();
@@ -548,6 +624,35 @@ void SessionManager::CloseProfileSessions(const std::string& agent_id) {
   }
 }
 
+void SessionManager::CloseAllSessions() {
+  std::vector<std::string> ids;
+  for (const auto& [id, session] : sessions_) {
+    ids.push_back(id);
+  }
+  for (const std::string& id : ids) {
+    Close(id);
+  }
+}
+
+bool SessionManager::HasHandles() const {
+  if (!sessions_.empty() || open_connections_ > 0) {
+    return true;
+  }
+  // A leased tab outlives its session only transiently (discard in flight).
+  for (BrowserWindowInterface* browser : GetAllBrowserWindowInterfaces()) {
+    TabStripModel* tab_strip = browser->GetTabStripModel();
+    if (!tab_strip || browser->GetProfile() != profile_) {
+      continue;
+    }
+    for (int i = 0; i < tab_strip->count(); ++i) {
+      if (!SessionOf(tab_strip->GetWebContentsAt(i)).empty()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 base::expected<content::WebContents*, std::string> SessionManager::AllocateTab(
     const std::string& session_id,
     const GURL& requested_url,
@@ -555,6 +660,14 @@ base::expected<content::WebContents*, std::string> SessionManager::AllocateTab(
   const Session* session = Get(session_id);
   if (!session) {
     return base::unexpected("Unknown session: " + session_id);
+  }
+  if (session->owner) {
+    // Isolated Profiles on: the tab joins the session only while the Profile
+    // still accepts work under the session's own owner tuple (a stop, restart
+    // or epoch change closes admission).
+    if (CurrentOwner(session->agent) != session->owner) {
+      return base::unexpected("The browser profile is not ready");
+    }
   }
   GURL url = requested_url.is_empty() ? GURL(url::kAboutBlankURL)
                                        : requested_url;
@@ -597,7 +710,13 @@ SessionManager::OpenTabForUser(const std::string& agent_id, const GURL& url) {
     return base::unexpected("Unknown agent: " + agent_id);
   }
   const Session* session = LatestSession(agent_id);
-  std::string session_id = session ? session->id : Open(agent_id).id;
+  if (!session) {
+    session = Open(agent_id);
+  }
+  if (!session) {
+    return base::unexpected("The browser profile is not ready");
+  }
+  std::string session_id = session->id;
   ASSIGN_OR_RETURN(content::WebContents * contents,
                    AllocateTab(session_id, url, std::nullopt));
   ShowTab(contents);
@@ -758,6 +877,29 @@ void SessionManager::Lease(content::WebContents* contents,
                            const std::string& session_id) {
   AgentTabLease::CreateForWebContents(contents, session_id,
                                       weak_factory_.GetWeakPtr());
+  RegisterTarget(contents, session_id);
+}
+
+void SessionManager::RegisterTarget(content::WebContents* contents,
+                                    const std::string& session_id) {
+  BrowserProfileRouter* router = BrowserProfileRouter::Get();
+  auto it = sessions_.find(session_id);
+  if (!router || it == sessions_.end() || !it->second.owner) {
+    return;
+  }
+  AgentTabLease* lease = AgentTabLease::FromWebContents(contents);
+  if (!lease) {
+    return;
+  }
+  // The lease exists before the agent host is created, so the Target.* events
+  // that creation sends already see the tab as the session's.
+  std::string target_id = TargetIdOf(contents);
+  TargetOwner target;
+  target.owner = *it->second.owner;
+  target.session_id = session_id;
+  target.partition = it->second.agent;
+  router->target_owners().Register(target_id, target);
+  lease->set_target_id(std::move(target_id));
 }
 
 void SessionManager::AddToSessionGroup(
@@ -929,7 +1071,13 @@ void SessionManager::AdoptTab(base::WeakPtr<content::WebContents> contents,
     return;  // Moved out of the group again.
   }
   const Session* session = LatestSession(agent_id);
-  std::string session_id = session ? session->id : Open(agent_id).id;
+  if (!session) {
+    session = Open(agent_id);
+  }
+  if (!session) {
+    return;  // Isolated Profiles on and the Profile accepts no work.
+  }
+  std::string session_id = session->id;
 
   // Already in the agent's storage: just (re-)lease it.
   if (contents->GetPrimaryMainFrame()->GetStoragePartition() ==

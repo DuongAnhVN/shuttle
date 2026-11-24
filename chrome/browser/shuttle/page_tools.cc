@@ -43,6 +43,7 @@
 #include "chrome/browser/shuttle/agent_browser_sidecar.h"
 #include "chrome/browser/shuttle/network_access.h"
 #include "chrome/browser/shuttle/profile_registry.h"
+#include "chrome/browser/shuttle/scope_auth.h"
 #include "chrome/browser/shuttle/session_manager.h"
 #include "content/public/browser/render_widget_host_view.h"
 #include "content/public/browser/web_contents.h"
@@ -1150,8 +1151,12 @@ Sidecar* PageToolManager::GetOrCreateSidecar(const std::string& session_id,
   config.binary = FindBinary();
   config.socket_dir = dir;
   config.screenshot_dir = dir.Append("shots");
+  // With isolated Profiles the session socket needs the session's own grant
+  // (never the admin token); "" otherwise.
+  std::string grant = SessionGrants::Get().GrantFor(session_id);
   config.cdp_endpoint = WithAccessToken(
-      base::StrCat({"ws://", host, "/devtools/session/", session_id}));
+      base::StrCat({"ws://", host, "/devtools/session/", session_id,
+                    grant.empty() ? "" : "?grant=", grant}));
   config.session_id = session_id;
   return sidecars_.emplace(session_id, std::make_unique<Sidecar>(config))
       .first->second.get();

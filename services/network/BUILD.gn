@@ -488,6 +488,7 @@ source_set("test_support") {
     "test/test_dns_util.h",
     "test/test_network_connection_tracker.cc",
     "test/test_network_connection_tracker.h",
+    "test/test_network_context.cc",
     "test/test_network_context.h",
     "test/test_network_context_client.cc",
     "test/test_network_context_client.h",

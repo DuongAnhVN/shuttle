@@ -17,6 +17,8 @@
 #include "base/strings/string_util.h"
 #include "base/task/single_thread_task_runner.h"
 #include "base/time/time.h"
+#include "chrome/browser/shuttle/browser_profile_router.h"
+#include "chrome/browser/shuttle/scope_auth.h"
 #include "chrome/browser/shuttle/session_manager.h"
 #include "content/public/browser/devtools_agent_host.h"
 #include "content/public/browser/web_contents.h"
@@ -161,13 +163,30 @@ std::unique_ptr<net::CanonicalCookie> CookieFromProtocol(
 SessionCdpFilter::SessionCdpFilter(base::WeakPtr<SessionManager> manager,
                                    std::string session_id,
                                    bool page_connection,
-                                   std::string page_target_id)
+                                   std::string page_target_id,
+                                   std::optional<FilterScope> scope)
     : manager_(std::move(manager)),
       session_id_(std::move(session_id)),
       page_connection_(page_connection),
-      page_target_id_(std::move(page_target_id)) {}
+      page_target_id_(std::move(page_target_id)),
+      scope_(std::move(scope)) {
+  if (scope_ && manager_) {
+    manager_->OnConnectionOpened();
+  }
+}
 
 SessionCdpFilter::~SessionCdpFilter() {
+  if (scope_) {
+    if (BrowserProfileRouter* router = BrowserProfileRouter::Get()) {
+      for (const auto& [child_session, target_id] : indexed_children_) {
+        router->target_owners().Remove(target_id);
+      }
+    }
+    if (manager_) {
+      manager_->RemoveSessionEndCallback(end_callback_id_);
+      manager_->OnConnectionClosed();
+    }
+  }
   // The connection ended: tabs it created die with it (allocate-tab tabs and
   // popups stay with the session). Posted: the connection may be closing
   // from inside an agent host's notification.
@@ -184,11 +203,118 @@ SessionCdpFilter::~SessionCdpFilter() {
 void SessionCdpFilter::Start(SendCallback to_agent, SendCallback to_client) {
   to_agent_ = std::move(to_agent);
   to_client_ = std::move(to_client);
+  if (scope_ && manager_) {
+    end_callback_id_ = manager_->AddSessionEndCallback(base::BindRepeating(
+        &SessionCdpFilter::OnSessionEnded, weak_factory_.GetWeakPtr()));
+  }
+}
+
+void SessionCdpFilter::SetCloseCallback(base::RepeatingClosure close) {
+  close_ = std::move(close);
+}
+
+void SessionCdpFilter::EndConnection() {
+  if (ended_) {
+    return;
+  }
+  ended_ = true;
+  if (close_) {
+    close_.Run();
+  }
+}
+
+void SessionCdpFilter::OnSessionEnded(const std::string& session_id) {
+  if (session_id == session_id_) {
+    EndConnection();
+  }
+}
+
+bool SessionCdpFilter::StillAuthorized() {
+  if (!scope_) {
+    return true;
+  }
+  if (ended_) {
+    return false;
+  }
+  BrowserProfileRouter* router = BrowserProfileRouter::Get();
+  if (!router || !manager_ || !manager_->Get(session_id_) ||
+      router->session_owners().Check(session_id_, scope_->owner) !=
+          OwnerCheck::kOk ||
+      SessionGrants::Get().GrantFor(session_id_).empty()) {
+    // Revoked (stop, restart, close) or never valid: the connection ends.
+    EndConnection();
+    return false;
+  }
+  return true;
+}
+
+bool SessionCdpFilter::IndexAllows(const std::string& target_id) const {
+  if (!scope_) {
+    return true;
+  }
+  BrowserProfileRouter* router = BrowserProfileRouter::Get();
+  if (!router) {
+    return false;
+  }
+  std::optional<TargetOwner> target = router->target_owners().Lookup(target_id);
+  if (!target) {
+    // Not indexed yet (a tab leased a moment ago, a popup): the lease and
+    // opener rules of Owns() decide.
+    return true;
+  }
+  return target->owner == scope_->owner && target->session_id == session_id_ &&
+         target->partition == scope_->owner.workspace_agent;
+}
+
+void SessionCdpFilter::IndexChildTarget(const std::string& child_session,
+                                        const std::string& target_id) {
+  BrowserProfileRouter* router = BrowserProfileRouter::Get();
+  if (!scope_ || !router || child_session.empty() || target_id.empty() ||
+      router->target_owners().Lookup(target_id)) {
+    return;
+  }
+  TargetOwner target;
+  target.owner = scope_->owner;
+  target.session_id = session_id_;
+  target.partition = scope_->owner.workspace_agent;
+  router->target_owners().Register(target_id, target);
+  indexed_children_[child_session] = target_id;
+}
+
+void SessionCdpFilter::UnindexChildTarget(const std::string& child_session) {
+  auto it = indexed_children_.find(child_session);
+  if (it == indexed_children_.end()) {
+    return;
+  }
+  if (BrowserProfileRouter* router = BrowserProfileRouter::Get()) {
+    router->target_owners().Remove(it->second);
+  }
+  indexed_children_.erase(it);
+}
+
+CdpCommandDecision SessionCdpFilter::ScopedDecision(
+    std::string_view method,
+    const base::DictValue* params,
+    const std::string* session) const {
+  CdpCommandInput input;
+  input.method = method;
+  input.form = session            ? CdpForm::kChildSession
+               : page_connection_ ? CdpForm::kPageRoot
+                                  : CdpForm::kBrowserRoot;
+  input.managed = scope_ && !scope_->owner.profile_key.empty();
+  if (scope_) {
+    input.own_browser_context_id = scope_->browser_context_id;
+  }
+  input.params = params;
+  return DecideScopedCdpCommand(input);
 }
 
 bool SessionCdpFilter::Owns(const std::string& target_id,
                             const std::string& opener_id) {
   if (target_id.empty()) {
+    return false;
+  }
+  if (!IndexAllows(target_id)) {
     return false;
   }
   if (visible_.contains(target_id) || allocating_ ||
@@ -204,6 +330,9 @@ bool SessionCdpFilter::Owns(const std::string& target_id,
 }
 
 void SessionCdpFilter::OnClientMessage(std::string message) {
+  if (!StillAuthorized()) {
+    return;
+  }
   if (manager_) {
     manager_->Touch(session_id_);
   }
@@ -212,13 +341,59 @@ void SessionCdpFilter::OnClientMessage(std::string message) {
   const std::string* method = dict ? dict->FindString("method") : nullptr;
   const base::Value* id = dict ? dict->Find("id") : nullptr;
   if (!method || !id) {
-    // Malformed: the agent host answers with the protocol error.
+    // Malformed: the agent host answers with the protocol error. (A scoped
+    // connection does not forward what it cannot read: it could hide a
+    // command.)
+    if (scope_) {
+      return;
+    }
     to_agent_.Run(std::move(message));
     return;
   }
   const std::string* session = dict->FindString("sessionId");
   const base::DictValue* params = dict->FindDict("params");
   std::string_view name = *method;
+
+  if (scope_) {
+    if (session && !own_sessions_.contains(*session)) {
+      SendError(*id, session, "Shuttle: unknown child session");
+      return;
+    }
+    if (name == "Target.detachFromTarget" && params) {
+      const std::string* child = params->FindString("sessionId");
+      if (child && !own_sessions_.contains(*child)) {
+        SendError(*id, session, "Shuttle: unknown child session");
+        return;
+      }
+    }
+  }
+  {
+    // One policy for legacy and isolated session/page sockets and flattened
+    // child session (nothing depends on how deeply a command is nested).
+    const CdpCommandDecision decision = ScopedDecision(name, params, session);
+    if (decision.verdict == CdpCommandVerdict::kDeny) {
+      SendError(*id, session, decision.message);
+      return;
+    }
+    if (name == "Target.getBrowserContexts") {
+      // Foreign contexts are not listed to a scoped session.
+      SendResult(*id, session,
+                 base::DictValue().Set("browserContextIds", base::ListValue()));
+      return;
+    }
+    if (decision.verdict == CdpCommandVerdict::kRouteCookiesToAgent) {
+      // The default context behind Storage.* is the startup Profile's: answer
+      // with the owner's agent partition on every form.
+      if (name == "Storage.getCookies") {
+        GetCookies(*id, session);
+      } else if (name == "Storage.setCookies") {
+        SetCookies(*id, session, params);
+      } else {
+        ClearCookies(*id, session);
+      }
+      return;
+    }
+  }
 
   if (name == "Target.getTargets") {
     if (id->is_int()) {
@@ -231,7 +406,8 @@ void SessionCdpFilter::OnClientMessage(std::string message) {
              name == "Target.exposeDevToolsProtocol" ||
              name == "Target.autoAttachRelated" ||
              name == "Target.sendMessageToTarget" ||
-             name == "Target.detachFromTarget") {
+             name == "Target.detachFromTarget" ||
+             (scope_ && name == "Browser.getWindowForTarget")) {
     std::string target_id = StringParam(params, "targetId");
     if (!target_id.empty() && !Owns(target_id, "")) {
       SendError(*id, session,
@@ -295,7 +471,41 @@ void SessionCdpFilter::OnClientMessage(std::string message) {
 }
 
 void SessionCdpFilter::OnAgentMessage(std::string message) {
+  if (!StillAuthorized()) {
+    return;
+  }
   std::string_view view(message);
+  // Parse security-sensitive events rather than relying on JSON key order.
+  if (auto event = base::JSONReader::ReadDict(message, base::JSON_PARSE_RFC)) {
+    const std::string* method = event->FindString("method");
+    const std::string* child = event->FindString("sessionId");
+    if (method && *method == "Target.receivedMessageFromTarget") {
+      return;
+    }
+    if (method &&
+        (method->starts_with("Browser.") || method->starts_with("Storage."))) {
+      return;
+    }
+    if (method && method->starts_with("Target.")) {
+      const std::string name = *method;
+      HandleTargetEvent(name, std::move(*event), std::move(message));
+      return;
+    }
+    if (scope_ && child && !own_sessions_.contains(*child)) {
+      return;
+    }
+  }
+  if (scope_ && !page_connection_ &&
+      (base::StartsWith(view, R"({"method":"Browser.)") ||
+       base::StartsWith(view, R"({"method":"Storage.)"))) {
+    // Browser-level events of these domains (downloads, storage updates)
+    // carry no owner: only those of an own child session pass.
+    std::optional<base::DictValue> event =
+        base::JSONReader::ReadDict(message, base::JSON_PARSE_RFC);
+    if (!event || !event->FindString("sessionId")) {
+      return;
+    }
+  }
   auto from_foreign_session = [&] {
     if (foreign_sessions_.empty()) {
       return false;
@@ -345,8 +555,14 @@ void SessionCdpFilter::OnAgentMessage(std::string message) {
 void SessionCdpFilter::HandleTargetEvent(const std::string& method,
                                          base::DictValue message,
                                          std::string raw) {
+  if (method == "Target.receivedMessageFromTarget") {
+    // Tunnelled messages are refused at the command side; one that arrives
+    // anyway (an attach that predates the filter) never reaches the client.
+    return;
+  }
   const std::string* parent = message.FindString("sessionId");
-  if (parent && foreign_sessions_.contains(*parent)) {
+  if (parent && (foreign_sessions_.contains(*parent) ||
+                 (scope_ && !own_sessions_.contains(*parent)))) {
     return;
   }
   base::DictValue* params = message.FindDict("params");
@@ -400,12 +616,21 @@ void SessionCdpFilter::HandleTargetEvent(const std::string& method,
     // page connections so do the root's (the root is the leased page).
     bool own = parent || page_connection_ || Owns(target_id, opener_id);
     if (own) {
+      if (!child.empty()) {
+        own_sessions_.insert(child);
+      }
       if (!parent && !page_connection_) {
         visible_.insert(target_id);
       }
       if (!parent && !child.empty() &&
           StringParam(info, "type") == "page") {
         session_targets_[child] = target_id;
+      }
+      if (scope_ &&
+          (parent || page_connection_ || visible_.contains(target_id))) {
+        // Workers and frames of an own target: attributed to the owner in the
+        // browser-wide target index.
+        IndexChildTarget(child, target_id);
       }
       to_client_.Run(std::move(raw));
       return;
@@ -426,7 +651,9 @@ void SessionCdpFilter::HandleTargetEvent(const std::string& method,
       method == "Target.receivedMessageFromTarget") {
     std::string child = StringParam(params, "sessionId");
     if (method == "Target.detachedFromTarget") {
+      own_sessions_.erase(child);
       session_targets_.erase(child);
+      UnindexChildTarget(child);
     }
     if (foreign_sessions_.contains(child)) {
       if (method == "Target.detachedFromTarget") {

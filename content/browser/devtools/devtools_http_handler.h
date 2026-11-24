@@ -79,7 +79,8 @@ class DevToolsHttpHandler {
                          const std::string& host,
                          DevToolsAgentHost::List agent_hosts,
                          bool for_tab);
-  void OnDiscoveryPageRequest(int connection_id);
+  void OnDiscoveryPageRequest(int connection_id,
+                              const net::HttpServerRequestInfo& info);
   // Shuttle: the in-browser MCP server at /mcp.
   void OnMcpRequest(int connection_id, const net::HttpServerRequestInfo& info);
   void SendMcpResponse(int connection_id,

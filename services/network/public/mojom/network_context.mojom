@@ -404,6 +404,13 @@ struct NetworkContextParams {
   // cookies. Otherwise it should be false.
   bool persist_session_cookies = false;
 
+  // In-process-lifetime handoff during scoped context retirement. Never written
+  // to profile metadata. Restored before binding the new context's receiver.
+  array<CanonicalCookie>? initial_cookies;
+  StorageHandoffMember? handoff_member;
+  // Released only after the staged owner has been destroyed.
+  pending_receiver<NetworkContext>? handoff_lifetime;
+
   // True if an HTTP cache should be used.
   bool http_cache_enabled = true;
   // Maximum size of the HTTP cache. 0 means to use the default size.
@@ -1050,6 +1057,12 @@ struct WildcardQuicHint {
 // allowed to access the network, please add a comment in the function as to
 // why network restrictions don’t apply to that request. More context on
 // network restrictions is in the comment for `RestrictNetworkForIds()` below.
+// An identity is specific to one partition construction attempt, not its path.
+struct StorageHandoffMember {
+  mojo_base.mojom.UnguessableToken attempt;
+  uint64 generation;
+};
+
 [RequireContext=sandbox.mojom.Context.kPrivilegedUtility]
 interface NetworkContext {
   // Sets a client for this network context.
@@ -1068,6 +1081,28 @@ interface NetworkContext {
 
   // Destroys all URLLoaderFactory bindings, which should then be regenerated.
   ResetURLLoaderFactories();
+
+  // Retires a service-owned context after flushing and snapshotting its cookies.
+  // All factories (including ignore-reset factories), clones and other dependent
+  // pipes are destroyed after the reply. `completion` is never bound: it is
+  // closed only after destruction has returned. Caller waits for both snapshot
+  // and completion disconnect, and must have drained clients.
+  [AllowedContext=sandbox.mojom.Context.kBrowser]
+  Retire(pending_receiver<NetworkContext> completion)
+      => (array<CanonicalCookie> cookies);
+
+  // Ordered after construction-time trusted restoration. Used on the private
+  // browser control pipe, never on an unactivated workload pipe.
+  AcknowledgeStorageHandoff() => ();
+  // Read-only observation on the ordinary released receiver. The common count
+  // is published only after the synchronous bind loop has finished.
+  GetStorageHandoffBoundCountForTesting() => (uint32 count);
+  // Prepare activation after durable commit, but do not bind workload yet.
+  // Reply confirms this generation retained the receiver for finalization.
+  [AllowedContext=sandbox.mojom.Context.kBrowser]
+  PrepareStorageHandoff(mojo_base.mojom.UnguessableToken transaction,
+      StorageHandoffMember member, pending_receiver<NetworkContext> workload)
+      => (bool prepared);
 
   // Uses Oblivious HTTP to indirectly perform the request. Specification at
   // https://ietf-wg-ohai.github.io/oblivious-http/draft-ietf-ohai-ohttp.html

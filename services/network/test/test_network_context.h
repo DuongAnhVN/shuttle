@@ -63,6 +63,17 @@ class TestNetworkContext : public mojom::NetworkContext {
 
   void SetClient(
       mojo::PendingRemote<mojom::NetworkContextClient> client) override {}
+  void Retire(mojo::PendingReceiver<mojom::NetworkContext> completion,
+              RetireCallback callback) override;
+  void AcknowledgeStorageHandoff(
+      AcknowledgeStorageHandoffCallback callback) override;
+  void GetStorageHandoffBoundCountForTesting(
+      GetStorageHandoffBoundCountForTestingCallback callback) override;
+  void PrepareStorageHandoff(
+      const base::UnguessableToken& transaction,
+      mojom::StorageHandoffMemberPtr member,
+      mojo::PendingReceiver<mojom::NetworkContext> workload,
+      PrepareStorageHandoffCallback callback) override;
   void CreateSocketFactory(
       mojo::PendingReceiver<mojom::SocketFactory> receiver) override {}
   void CreateURLLoaderFactory(

@@ -35,6 +35,7 @@
 #include "mojo/public/cpp/bindings/pending_remote.h"
 #include "mojo/public/cpp/bindings/receiver.h"
 #include "mojo/public/cpp/bindings/receiver_set.h"
+#include "mojo/public/cpp/system/simple_watcher.h"
 #include "mojo/public/cpp/bindings/remote.h"
 #include "mojo/public/cpp/bindings/remote_set.h"
 #include "mojo/public/cpp/bindings/unique_receiver_set.h"
@@ -274,6 +275,23 @@ class COMPONENT_EXPORT(NETWORK_SERVICE) NetworkContext
       mojo::PendingReceiver<mojom::URLLoaderFactory> receiver,
       mojom::URLLoaderFactoryParamsPtr params) override;
   void ResetURLLoaderFactories() override;
+  void Retire(mojo::PendingReceiver<mojom::NetworkContext> completion,
+              RetireCallback callback) override;
+  void AcknowledgeStorageHandoff(AcknowledgeStorageHandoffCallback callback) override;
+  void GetStorageHandoffBoundCountForTesting(
+      GetStorageHandoffBoundCountForTestingCallback callback) override;
+  void PrepareStorageHandoff(const base::UnguessableToken& transaction,
+      mojom::StorageHandoffMemberPtr member,
+      mojo::PendingReceiver<mojom::NetworkContext> workload,
+      PrepareStorageHandoffCallback callback) override;
+  bool CanReleaseStorageHandoff(const mojom::StorageHandoffMember& member) const;
+  base::WeakPtr<NetworkContext> GetStorageHandoffWeakPtr();
+  // Only the NetworkService coordinator calls this, in its non-yielding batch.
+  void BindStorageHandoffWorkload(
+      mojo::PendingReceiver<mojom::NetworkContext> workload,
+      std::shared_ptr<size_t> bound_count);
+  void RestoreCookies(const std::optional<std::vector<net::CanonicalCookie>>& cookies,
+                      base::OnceCallback<void(bool)> callback);
   void GetViaObliviousHttp(
       mojom::ObliviousHttpRequestPtr request,
       mojo::PendingRemote<mojom::ObliviousHttpClient> client) override;
@@ -1283,6 +1301,12 @@ class COMPONENT_EXPORT(NETWORK_SERVICE) NetworkContext
 
   SEQUENCE_CHECKER(sequence_checker_);
 
+  bool retiring_ = false;
+  bool handoff_workload_released_ = false;
+  std::shared_ptr<size_t> handoff_bound_count_;
+  bool handoff_workload_prepared_ = false;
+  mojo::PendingReceiver<mojom::NetworkContext> restoring_handoff_receiver_;
+  std::unique_ptr<mojo::SimpleWatcher> restoring_handoff_watcher_;
   base::WeakPtrFactory<NetworkContext> weak_factory_{this};
 };
 

@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "chrome/browser/net/profile_network_context_service.h"
+#include "chrome/browser/shuttle/managed_network_admission.h"
 
 #include <memory>
 #include <optional>
@@ -538,6 +539,21 @@ ProfileNetworkContextService::ProfileNetworkContextService(Profile* profile)
 }
 
 ProfileNetworkContextService::~ProfileNetworkContextService() = default;
+
+bool ProfileNetworkContextService::ConfigureNetworkContextParamsForHandoff(
+    content::StoragePartition* participant,
+    const content::NetworkContextHandoffProof& proof, bool in_memory,
+    const base::FilePath& relative_partition_path,
+    network::mojom::NetworkContextParams* network_context_params,
+    cert_verifier::mojom::CertVerifierCreationParams* cert_verifier_creation_params) {
+  if (is_shutting_down_ || !proof.AuthorizesConfiguration(profile_, participant) ||
+      !shuttle::ProfilePersonaServiceFactory::GetForProfileIfExists(profile_) ||
+      !shuttle::ProfileProxyServiceFactory::GetForProfileIfExists(profile_))
+    return false;
+  ConfigureNetworkContextParamsInternal(in_memory, relative_partition_path,
+      network_context_params, cert_verifier_creation_params, &proof, participant);
+  return proof.AuthorizesConfiguration(profile_, participant);
+}
 
 void ProfileNetworkContextService::ConfigureNetworkContextParams(
     bool in_memory,
@@ -1240,7 +1256,11 @@ void ProfileNetworkContextService::ConfigureNetworkContextParamsInternal(
     const base::FilePath& relative_partition_path,
     network::mojom::NetworkContextParams* network_context_params,
     cert_verifier::mojom::CertVerifierCreationParams*
-        cert_verifier_creation_params) {
+        cert_verifier_creation_params,
+    const content::NetworkContextHandoffProof* proof,
+    content::StoragePartition* participant) {
+  CHECK(shuttle::ManagedNetworkAdmissionReady(profile_) ||
+        (proof && proof->AuthorizesConfiguration(profile_, participant)));
   TRACE_EVENT0(
       "startup",
       "ProfileNetworkContextService::ConfigureNetworkContextParamsInternal");
@@ -1359,7 +1379,8 @@ void ProfileNetworkContextService::ConfigureNetworkContextParamsInternal(
   // Agent partitions take their proxy from their agent (see
   // ProfileProxyService); every other partition keeps the system proxy.
   if (shuttle::ProfileProxyService* proxies =
-          shuttle::ProfileProxyServiceFactory::GetForProfile(profile_)) {
+          proof ? shuttle::ProfileProxyServiceFactory::GetForProfileIfExists(profile_)
+                : shuttle::ProfileProxyServiceFactory::GetForProfile(profile_)) {
     proxies->ConfigureNetworkContextParams(relative_partition_path,
                                            network_context_params);
   }
@@ -1367,7 +1388,8 @@ void ProfileNetworkContextService::ConfigureNetworkContextParamsInternal(
   // and user agent from all its NetworkContexts (main and partitions), not
   // the profile's.
   if (shuttle::ProfilePersonaService* personas =
-          shuttle::ProfilePersonaServiceFactory::GetForProfile(profile_)) {
+          proof ? shuttle::ProfilePersonaServiceFactory::GetForProfileIfExists(profile_)
+                : shuttle::ProfilePersonaServiceFactory::GetForProfile(profile_)) {
     personas->ConfigureNetworkContextParams(network_context_params);
   }
 

@@ -9,6 +9,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <string_view>
 
 #include "base/gtest_prod_util.h"
 #include "chrome/browser/devtools/device/devtools_device_discovery.h"
@@ -70,12 +71,20 @@ class ChromeDevToolsManagerDelegate : public content::DevToolsManagerDelegate {
   void HandleCommand(content::DevToolsAgentHostClientChannel* channel,
                      base::span<const uint8_t> message,
                      NotHandledCallback callback) override;
+  bool VerifyAdminToken(std::string_view presented) override;
+  bool AllowBrowserGlobalHttp(const RequestContext& context) override;
   void HandleMcpRequest(const std::string& host,
                         const std::string& body,
+                        const RequestContext& context,
                         HttpResponseCallback callback) override;
   std::unique_ptr<ConnectionFilter> CreateConnectionFilter(
       const std::string& session_id,
-      const std::string& target_id) override;
+      const std::string& target_id,
+      const RequestContext& context) override;
+  ConnectionDecision DecideConnection(ConnectionKind kind,
+                                      const std::string& session_id,
+                                      const std::string& target_id,
+                                      const RequestContext& context) override;
   std::string GetTargetType(content::WebContents* web_contents) override;
   std::string GetTargetTitle(content::WebContents* web_contents) override;
   std::unique_ptr<base::DictValue> GetTargetEmbedderData(

@@ -25,6 +25,7 @@ class ProfileProxyServiceFactory : public ProfileKeyedServiceFactory {
  public:
   // Null for profiles without agents (off-the-record, system).
   static ProfileProxyService* GetForProfile(Profile* profile);
+  static ProfileProxyService* GetForProfileIfExists(Profile* profile);
   static ProfileProxyServiceFactory* GetInstance();
 
   ProfileProxyServiceFactory(const ProfileProxyServiceFactory&) = delete;

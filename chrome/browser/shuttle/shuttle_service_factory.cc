@@ -28,7 +28,12 @@ ShuttleServiceFactory* ShuttleServiceFactory::GetInstance() {
 ShuttleServiceFactory::ShuttleServiceFactory()
     : ProfileKeyedServiceFactory(
           "ShuttleService",
-          // Shuttle runs one regular profile; nothing else gets agents.
+          // Every regular Profile gets its own service, keyed by Profile: the
+          // startup Profile (legacy agents, unchanged) and every managed
+          // (isolated) Chromium Profile of --shuttle-isolated-profiles, each
+          // with its own agent registry (the same agent slug in two Profiles
+          // is two agents), session manager, sidecars and proxy/persona
+          // services. Off-the-record, guest and system profiles get none.
           ProfileSelections::Builder()
               .WithRegular(ProfileSelection::kOriginalOnly)
               .Build()) {

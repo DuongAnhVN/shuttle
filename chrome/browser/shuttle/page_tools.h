@@ -56,6 +56,12 @@ class PageToolManager {
   // Browser shutdown: kill all sidecars now.
   void Shutdown();
 
+  // A sidecar (worker process) is running or still closing: a Profile stop
+  // waits for false before it reports `stopped`.
+  bool HasLiveSidecars() const {
+    return !sidecars_.empty() || !retiring_.empty();
+  }
+
   // Path of the agent-browser binary: $SHUTTLE_AGENT_BROWSER, else
   // <app>/Contents/Helpers/agent-browser (macOS) or next to the executable.
   static base::FilePath FindBinary();

@@ -135,14 +135,101 @@ void DevToolsManagerDelegate::AcceptDebugging(AcceptCallback callback) {
 
 void DevToolsManagerDelegate::SetActiveWebSocketConnections(size_t count) {}
 
+DevToolsManagerDelegate::RequestContext::RequestContext() = default;
+DevToolsManagerDelegate::RequestContext::RequestContext(
+    const RequestContext& other) = default;
+DevToolsManagerDelegate::RequestContext&
+DevToolsManagerDelegate::RequestContext::operator=(
+    const RequestContext& other) = default;
+DevToolsManagerDelegate::RequestContext::~RequestContext() = default;
+
+DevToolsManagerDelegate::ConnectionDecision::ConnectionDecision() = default;
+DevToolsManagerDelegate::ConnectionDecision::ConnectionDecision(
+    ConnectionDecision&& other) = default;
+DevToolsManagerDelegate::ConnectionDecision&
+DevToolsManagerDelegate::ConnectionDecision::operator=(
+    ConnectionDecision&& other) = default;
+DevToolsManagerDelegate::ConnectionDecision::~ConnectionDecision() = default;
+
+// static
+DevToolsManagerDelegate::ConnectionDecision
+DevToolsManagerDelegate::ConnectionDecision::AdminAllowed() {
+  ConnectionDecision decision;
+  decision.kind = Kind::kAdminAllowed;
+  decision.http_status = 200;
+  return decision;
+}
+
+// static
+DevToolsManagerDelegate::ConnectionDecision
+DevToolsManagerDelegate::ConnectionDecision::Scoped(
+    std::unique_ptr<ConnectionFilter> filter) {
+  ConnectionDecision decision;
+  if (!filter) {
+    // A scoped decision without a filter is a bug: fail closed.
+    return Denied(403);
+  }
+  decision.kind = Kind::kScopedFilter;
+  decision.filter = std::move(filter);
+  decision.http_status = 200;
+  return decision;
+}
+
+// static
+DevToolsManagerDelegate::ConnectionDecision
+DevToolsManagerDelegate::ConnectionDecision::Denied(int http_status) {
+  ConnectionDecision decision;
+  decision.kind = Kind::kDenied;
+  decision.http_status = http_status == 404 ? 404 : 403;
+  return decision;
+}
+
+bool DevToolsManagerDelegate::VerifyAdminToken(std::string_view presented) {
+  return false;
+}
+
+bool DevToolsManagerDelegate::AllowBrowserGlobalHttp(
+    const RequestContext& context) {
+  return true;
+}
+
 std::unique_ptr<DevToolsManagerDelegate::ConnectionFilter>
-DevToolsManagerDelegate::CreateConnectionFilter(const std::string& session_id,
-                                                const std::string& target_id) {
+DevToolsManagerDelegate::CreateConnectionFilter(
+    const std::string& session_id,
+    const std::string& target_id,
+    const RequestContext& context) {
   return nullptr;
+}
+
+DevToolsManagerDelegate::ConnectionDecision
+DevToolsManagerDelegate::DecideConnection(ConnectionKind kind,
+                                          const std::string& session_id,
+                                          const std::string& target_id,
+                                          const RequestContext& context) {
+  switch (kind) {
+    case ConnectionKind::kBrowser:
+      return ConnectionDecision::AdminAllowed();
+    case ConnectionKind::kSession: {
+      std::unique_ptr<ConnectionFilter> filter =
+          CreateConnectionFilter(session_id, std::string(), context);
+      return filter ? ConnectionDecision::Scoped(std::move(filter))
+                    : ConnectionDecision::Denied(404);
+    }
+    case ConnectionKind::kPage: {
+      std::unique_ptr<ConnectionFilter> filter =
+          CreateConnectionFilter(std::string(), target_id, context);
+      // Legacy semantics, spelled out: a page that is not a leased tab is
+      // reachable raw. Embedders that isolate Profiles override this method.
+      return filter ? ConnectionDecision::Scoped(std::move(filter))
+                    : ConnectionDecision::AdminAllowed();
+    }
+  }
+  return ConnectionDecision::Denied(403);
 }
 
 void DevToolsManagerDelegate::HandleMcpRequest(const std::string& host,
                                                const std::string& body,
+                                               const RequestContext& context,
                                                HttpResponseCallback callback) {
   std::move(callback).Run(404, "text/plain", "Not found");
 }

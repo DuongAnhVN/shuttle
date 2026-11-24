@@ -26,6 +26,7 @@
 #include "base/time/time.h"
 #include "base/timer/elapsed_timer.h"
 #include "base/timer/timer.h"
+#include "base/unguessable_token.h"
 #include "build/build_config.h"
 #include "components/vrp_flags/buildflags.h"
 #include "mojo/public/cpp/bindings/pending_receiver.h"
@@ -96,6 +97,7 @@ class NetLogProxySink;
 class NetworkContext;
 class NetworkService;
 class SCTAuditingCache;
+class StorageHandoffTransaction;
 
 class COMPONENT_EXPORT(NETWORK_SERVICE) NetworkService
     : public mojom::NetworkService,
@@ -176,6 +178,13 @@ class COMPONENT_EXPORT(NETWORK_SERVICE) NetworkService
   void CreateNetworkContext(
       mojo::PendingReceiver<mojom::NetworkContext> receiver,
       mojom::NetworkContextParamsPtr params) override;
+  void BeginStorageHandoff(
+      mojo::PendingReceiver<mojom::StorageHandoffTransaction> receiver,
+      std::vector<mojom::StorageHandoffMemberPtr> expected,
+      BeginStorageHandoffCallback callback) override;
+  bool PrepareStorageHandoff(const base::UnguessableToken& transaction,
+      const mojom::StorageHandoffMember& member, NetworkContext* context,
+      mojo::PendingReceiver<mojom::NetworkContext> workload);
   void BindNetworkContextCreator(
       mojo::PendingReceiver<mojom::NetworkContextCreator> receiver) override;
   void ConfigureStubHostResolver(
@@ -615,6 +624,10 @@ class COMPONENT_EXPORT(NETWORK_SERVICE) NetworkService
   bool use_mock_url_session_url_loader_for_testing_{false};
 #endif
 
+  const base::UnguessableToken handoff_service_instance_ =
+      base::UnguessableToken::Create();
+  std::map<base::UnguessableToken, std::unique_ptr<StorageHandoffTransaction>>
+      handoff_transactions_;
   base::WeakPtrFactory<NetworkService> weak_factory_{this};
 };
 

@@ -21,6 +21,8 @@ class ProfileNetworkContextServiceFactory : public ProfileKeyedServiceFactory {
   // |browser_context|.
   static ProfileNetworkContextService* GetForContext(
       content::BrowserContext* browser_context);
+  static ProfileNetworkContextService* GetForContextIfExists(
+      content::BrowserContext* browser_context);
 
   // Returns the NetworkContextServiceFactory singleton.
   static ProfileNetworkContextServiceFactory* GetInstance();

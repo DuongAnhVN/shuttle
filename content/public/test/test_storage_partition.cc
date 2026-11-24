@@ -19,6 +19,16 @@ namespace content {
 TestStoragePartition::TestStoragePartition() {}
 TestStoragePartition::~TestStoragePartition() {}
 
+void TestStoragePartition::StageNetworkContextHandoff(
+    NetworkContextHandoffProof proof, base::OnceCallback<void(bool)> callback) {
+  std::move(callback).Run(false);
+}
+
+void TestStoragePartition::FenceNetworkContextHandoff(
+    base::OnceCallback<void(bool)> callback) {
+  std::move(callback).Run(false);
+}
+
 const StoragePartitionConfig& TestStoragePartition::GetConfig() const {
   return config_;
 }
@@ -233,6 +243,11 @@ void TestStoragePartition::ClearCodeCaches(
 void TestStoragePartition::Flush() {}
 
 void TestStoragePartition::ResetURLLoaderFactories() {}
+
+void TestStoragePartition::RetireNetworkContext(
+    base::OnceCallback<void(bool)> callback) {
+  std::move(callback).Run(true);
+}
 
 void TestStoragePartition::ClearBluetoothAllowedDevicesMap() {}
 

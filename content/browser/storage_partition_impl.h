@@ -52,6 +52,7 @@
 #include "services/network/public/mojom/device_bound_sessions.mojom.h"
 #include "services/network/public/mojom/network_context.mojom-forward.h"
 #include "services/network/public/mojom/network_context_client.mojom.h"
+#include "net/cookies/canonical_cookie.h"
 #include "storage/browser/quota/quota_client_type.h"
 #include "storage/browser/quota/quota_settings.h"
 #include "third_party/abseil-cpp/absl/container/flat_hash_map.h"
@@ -238,6 +239,24 @@ class CONTENT_EXPORT StoragePartitionImpl
       base::OnceClosure callback) override;
   void Flush() override;
   void ResetURLLoaderFactories() override;
+  void RetireNetworkContext(base::OnceCallback<void(bool)> callback) override;
+  std::shared_ptr<NetworkContextHandoffState>
+  GetNetworkContextHandoffState() const override;
+  std::shared_ptr<NetworkContextHandoffState>
+  BeginNetworkContextHandoffState() override;
+  void StageNetworkContextHandoff(NetworkContextHandoffProof proof,
+                                 base::OnceCallback<void(bool)> callback) override;
+  void FenceNetworkContextHandoff(base::OnceCallback<void(bool)> callback) override;
+  network::mojom::StorageHandoffMemberPtr
+  GetNetworkContextHandoffConstructionMember() const override;
+  bool IsNetworkContextHandoffRestored() const override;
+  network::mojom::StorageHandoffMemberPtr GetNetworkContextHandoffMember() const override;
+  void SetNetworkContextHandoffTransaction(
+      const base::UnguessableToken& transaction) override;
+  void SetNetworkContextHandoffReleasePossible(bool possible) override;
+  void ActivateNetworkContextHandoff(base::OnceCallback<void(bool)> callback) override;
+  void FinalizeNetworkContextHandoff(bool success) override;
+  void AbortNetworkContextHandoff(base::OnceClosure callback) override;
   void ClearBluetoothAllowedDevicesMap() override;
   void AddObserver(DataRemovalObserver* observer) override;
   void RemoveObserver(DataRemovalObserver* observer) override;
@@ -753,6 +772,14 @@ class CONTENT_EXPORT StoragePartitionImpl
   // Called to initialize `network_context_` when `GetNetworkContext()` is
   // first called or there is an error.
   void InitNetworkContext();
+  void RetireNetworkContextAfterWorkersStopped(
+      base::OnceCallback<void(bool)> callback);
+  void InitAdmittedNetworkContext(
+      uint64_t generation,
+      std::optional<NetworkContextHandoffProof> proof,
+      mojo::PendingReceiver<network::mojom::NetworkContext> receiver,
+      mojo::PendingReceiver<cert_verifier::mojom::CertVerifierServiceUpdater>
+          updater_receiver);
 
   bool is_in_memory() const { return config_.in_memory(); }
 
@@ -854,6 +881,23 @@ class CONTENT_EXPORT StoragePartitionImpl
   // Owns the NetworkContext used to make requests for the StoragePartition.
   // Forward declared so we don't need to include network_context.mojom.h here.
   std::unique_ptr<NetworkContextOwner> network_context_owner_;
+  uint64_t network_context_generation_ = 0;
+  bool network_context_admitted_ = false;
+  bool network_context_retiring_ = false;
+  bool network_context_retirement_failed_ = false;
+  mojo::Remote<network::mojom::NetworkContext> retirement_completion_;
+  std::shared_ptr<NetworkContextHandoffState> handoff_state_ =
+      std::make_shared<NetworkContextHandoffState>();
+  mojo::Remote<network::mojom::NetworkContext> handoff_control_;
+  mojo::Remote<network::mojom::NetworkContext> handoff_lifetime_;
+  bool handoff_rollback_pending_ = false;
+  std::vector<base::OnceClosure> handoff_rollback_waiters_;
+  mojo::PendingReceiver<network::mojom::NetworkContext> handoff_workload_;
+  bool handoff_restored_ = false;
+  bool handoff_restore_attempted_ = false;
+  base::UnguessableToken handoff_attempt_;
+  base::UnguessableToken handoff_transaction_;
+  base::OnceCallback<void(bool)> handoff_callback_;
 
   mojo::Receiver<network::mojom::NetworkContextClient>
       network_context_client_receiver_{this};
