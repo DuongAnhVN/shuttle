@@ -14,6 +14,7 @@
 
 #include "base/functional/callback_forward.h"
 #include "base/functional/callback.h"
+#include "base/memory/raw_ptr.h"
 #include "base/observer_list_types.h"
 #include "base/time/time.h"
 #include "base/unguessable_token.h"
@@ -104,8 +105,8 @@ class CONTENT_EXPORT NetworkContextHandoffProof {
   bool Bind(const base::UnguessableToken& attempt, uint64_t generation);
   bool IsBoundTo(const base::UnguessableToken& attempt,
                  uint64_t generation) const;
-  BrowserContext* context_ = nullptr;
-  StoragePartition* participant_ = nullptr;
+  raw_ptr<BrowserContext> context_ = nullptr;
+  raw_ptr<StoragePartition> participant_ = nullptr;
   base::RepeatingCallback<bool()> owns_handoff_;
   base::UnguessableToken attempt_;
   uint64_t generation_ = 0;
