@@ -133,7 +133,10 @@ NOTICE) supplies the page tools, proxied through `/mcp`.
   At most 4 screenshots run at once across sessions (else "Busy ... retry"); captures are read and rescaled on one
   sequence (one decode at a time). Probe: `smoke-page-tools.mjs` (own 2x launch in smoke-all).
 - `PageToolManager` keeps one `Sidecar` per session (`agent-browser mcp --tools all`, env `AGENT_BROWSER_CDP=<session
-  endpoint>`, `AGENT_BROWSER_SESSION`, short `AGENT_BROWSER_SOCKET_DIR`: Mac socket paths max ~100 chars). Calls are
+  endpoint>`, constant `AGENT_BROWSER_SESSION=s`, `AGENT_BROWSER_NAMESPACE` unset, private per-session
+  `AGENT_BROWSER_SOCKET_DIR=<tmp>/acab-<16 hex of SHA-256(session id)>`: the daemon socket `<dir>/s.sock` is the temp dir
+  + 29 bytes and must stay <= 100 bytes (Mac `sun_path` 104); a longer `TMPDIR` (> 71 bytes) moves the dir to `/tmp`.
+  `scripts/check-sidecar-socket-path.mjs` models and checks the lengths). Calls are
   serialized per sidecar; a `tab_switch {tab:<targetId>}` precedes calls for a different tab. Never set
   `AGENT_BROWSER_PIN_TAB` (a fresh daemon opens a stray tab).
 - Each sidecar starts a daemon that outlives the MCP process: on session close send the `close` tool (3 s), then

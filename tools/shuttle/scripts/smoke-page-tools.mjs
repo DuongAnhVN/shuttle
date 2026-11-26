@@ -5,8 +5,11 @@
 //      browser reads the capture file itself): CSS scale 1280x1000, device + maxSize 1568 gives 1568x1225.
 //   3. scale device + format png of that page (no rescale, over 10 MB): a clear error, never success without image.
 //   4. Six concurrent screenshots: at most 4 admitted, the rest "Busy"; admitted ones carry images; a later call works.
-//   5. No capture files are left in the session's shots directory.
-import { readdirSync } from 'node:fs';
+//   0. A snapshot shows the page's body marker (sidecar read path).
+//   5. The session's sidecar directory (acab-<hash>, private, <dir>/s.sock, no namespace dir) exists and holds no
+//      capture files in its shots directory.
+import { createHash } from 'node:crypto';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { check, cleanup, finish, gone, mcp, rpc, skip } from './lib/smoke.mjs';
@@ -43,7 +46,8 @@ await mcp('create-agent', { id: AGENT, name: 'Smoke page tools' }).catch(async (
 ({ sessionId } = await mcp('open-session', { agent: AGENT }));
 const { targetId } = await mcp('allocate-tab', { sessionId });
 await mcp('set-tab-viewport', { targetId, width: 1280, height: 800 });
-const plain = 'data:text/html,' + encodeURIComponent('<body style="margin:0;font:16px sans-serif"><h1>Shot</h1>' +
+const MARKER = 'pt-marker-7f3a91';
+const plain = 'data:text/html,' + encodeURIComponent(`<body style="margin:0;font:16px sans-serif"><h1>${MARKER}</h1>` +
   '<p>line</p>'.repeat(20) + '</body>');
 await mcp('open', { targetId, url: plain });
 
@@ -55,6 +59,9 @@ const dprText = JSON.stringify(dpr);
 check('the launch emulates a 2x display', /\b2\b/.test(dprText), dprText.slice(0, 80));
 const v = image(first);
 check('viewport screenshot: CSS px JPEG', v?.mime === 'image/jpeg' && v.w === 1280 && v.h === 800, desc(first));
+// The sidecar's read path (daemon socket up, tab bound): the snapshot shows the page's body marker.
+const snap = await call('snapshot', { targetId });
+check('snapshot reads the page body marker', !snap.isError && text(snap).includes(MARKER), text(snap).slice(0, 120));
 const small = await call('screenshot', { targetId, maxSize: 640 });
 const s = image(small);
 check('maxSize 640: longer edge 640', s?.w === 640 && s.h === 400, desc(small));
@@ -88,10 +95,27 @@ check('six concurrent screenshots: 2+ busy, the rest images', busy >= 2 && many.
 const after = await call('screenshot', { targetId });
 check('a screenshot after the burst works (slots released)', !!image(after), desc(after));
 
-// 5. Files.
-let left = [];
-try { left = readdirSync(join(tmpdir(), 'acab', sessionId, 'shots')).filter((n) => n.startsWith('shot-')); }
-catch (e) { left = [`(${e.code})`]; }
-check('no capture files left in the shots directory', left.length === 0, left.join(' '));
+// 5. Files. The sidecar dir (PageToolManager's SessionDir) is acab-<first 16 hex of SHA-256(session id)> in the
+// browser's temp dir, or in /tmp when <tmp>/acab-<16>/s.sock would pass 100 bytes. The browser and this probe share
+// TMPDIR (smoke-all.sh); look in both and fail when the directory is nowhere (the old <tmp>/acab/<id> is gone).
+const SOCKET_MAX = 100;
+const dirName = `acab-${createHash('sha256').update(sessionId).digest('hex').slice(0, 16)}`;
+const dir = [join(tmpdir(), dirName), join('/tmp', dirName)].find((d) => existsSync(d));
+check('the session sidecar directory exists (hashed name, temp dir or /tmp)', !!dir, `${dirName} in ${tmpdir()} or /tmp`);
+if (dir) {
+  const mode = statSync(dir).mode & 0o7777;
+  check('sidecar directory is private (0700)', mode === 0o700, mode.toString(8));
+  // agent-browser 0.41.2: <socket dir>/<session>.sock; a namespace would nest <socket dir>/<ns>/<session>.sock.
+  const entries = readdirSync(dir, { withFileTypes: true });
+  const nested = entries.filter((e) => e.isDirectory() && e.name !== 'shots').map((e) => e.name);
+  check('daemon socket is <dir>/s.sock: constant session, no namespace directory', nested.length === 0 &&
+    entries.some((e) => e.name === 's.sock'), entries.map((e) => e.name).join(' '));
+  check(`socket path fits ${SOCKET_MAX} bytes`, Buffer.byteLength(join(dir, 's.sock')) <= SOCKET_MAX, join(dir, 's.sock'));
+  const shots = join(dir, 'shots');
+  const left = existsSync(shots) ? readdirSync(shots).filter((n) => n.startsWith('shot-')) : [];
+  check('no capture files left in the shots directory', left.length === 0, left.join(' '));
+} else {
+  check('no capture files left in the shots directory', false, 'sidecar directory not found');
+}
 
 finish();

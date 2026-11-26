@@ -4,7 +4,9 @@
 
 #include "chrome/browser/shuttle/agent_browser_sidecar.h"
 
+#include <errno.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <utility>
@@ -35,6 +37,23 @@ constexpr base::TimeDelta kCloseTimeout = base::Seconds(3);
 // The daemon agent-browser starts per session exits after this much idle
 // time, a fallback for when we couldn't ask it to close (browser shutdown).
 constexpr char kDaemonIdleMs[] = "60000";
+
+// Creates `dir` (its parent too, if missing) as a private directory: mode
+// 0700, owned by this user, not a link. False when it can't be made so.
+bool PreparePrivateDir(const base::FilePath& dir) {
+  if (!base::CreateDirectory(dir.DirName())) {
+    return false;
+  }
+  if (mkdir(dir.value().c_str(), 0700) != 0 && errno != EEXIST) {
+    return false;
+  }
+  struct stat st;
+  if (lstat(dir.value().c_str(), &st) != 0 || !S_ISDIR(st.st_mode) ||
+      st.st_uid != geteuid()) {
+    return false;
+  }
+  return (st.st_mode & 07777) == 0700 || chmod(dir.value().c_str(), 0700) == 0;
+}
 
 // Reads `fd` until EOF, running `on_line` for every line and `on_exit` at the
 // end. Blocks: runs as its own thread pool task.
@@ -79,7 +98,9 @@ class Sidecar::Io {
     if (!base::PathExists(config.binary)) {
       return StartResult::kNotInstalled;
     }
-    base::CreateDirectory(config.socket_dir);
+    if (!PreparePrivateDir(config.socket_dir)) {
+      return StartResult::kFailed;
+    }
     base::CreateDirectory(config.screenshot_dir);
 
     int in_pipe[2];
@@ -101,7 +122,14 @@ class Sidecar::Io {
     options.fds_to_remap.emplace_back(child_stdout.get(), STDOUT_FILENO);
     options.fds_to_remap.emplace_back(dev_null.get(), STDERR_FILENO);
     options.environment["AGENT_BROWSER_CDP"] = config.cdp_endpoint;
-    options.environment["AGENT_BROWSER_SESSION"] = config.session_id;
+    // A short constant daemon session: the socket is
+    // <socket_dir>/<name>.sock and the (unique, private) socket dir already
+    // isolates sessions. The full session id would not fit a unix socket path.
+    options.environment["AGENT_BROWSER_SESSION"] = kDaemonSessionName;
+    // Empty value = unset in the child: a namespace from our own environment
+    // would add path components to the socket path (and could point it
+    // outside our private dir).
+    options.environment["AGENT_BROWSER_NAMESPACE"] = "";
     // No AGENT_BROWSER_PIN_TAB: pinned, a fresh daemon opens a new tab of its
     // own. Every call switches to its targetId tab first anyway.
     options.environment["AGENT_BROWSER_SOCKET_DIR"] =

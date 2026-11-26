@@ -25,6 +25,12 @@ namespace shuttle {
 // killing run on a blocking thread pool sequence, reading on its own task.
 // Created lazily by PageToolManager on the first page-tool call.
 //
+// The agent-browser daemon session name (AGENT_BROWSER_SESSION), the same for
+// every sidecar: the socket is <Config::socket_dir>/<name>.sock, and the
+// socket dir is already unique and private per Shuttle session. Short on
+// purpose: unix socket paths max ~100 bytes (see PageToolManager's SessionDir).
+inline constexpr char kDaemonSessionName[] = "s";
+
 // Tool calls are queued and run one at a time (agent-browser keeps "current
 // tab" state, so a tab switch and the call that follows must not interleave).
 class Sidecar {
@@ -35,11 +41,15 @@ class Sidecar {
     ~Config();
 
     base::FilePath binary;
-    // Where the daemon sockets / screenshots go (created on start).
+    // Where the daemon sockets / screenshots go. `socket_dir` is created
+    // (mode 0700, owned by this user, not a link) on start; it must be unique
+    // to this session.
     base::FilePath socket_dir;
     base::FilePath screenshot_dir;
     // ws://host/devtools/session/<id>
     std::string cdp_endpoint;
+    // The Shuttle session id: logging only (the daemon session name is
+    // kDaemonSessionName).
     std::string session_id;
   };
 

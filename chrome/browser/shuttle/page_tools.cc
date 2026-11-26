@@ -581,14 +581,38 @@ struct ScreenshotJob {
   bool png = false;
 };
 
-// The session's sidecar directory (sockets; the shots directory below it).
-// Short: unix socket paths max ~100 chars.
+// Longest daemon socket path we accept: sun_path is 104 bytes on macOS (108 on
+// Linux), NUL included; some margin below that.
+constexpr size_t kMaxSocketPathBytes = 100;
+
+// The session's sidecar directory (the daemon socket; the shots directory below
+// it). One private directory per session directly in the temp dir (no shared
+// parent), named from a hash of the session id (the socket is
+// <dir>/<kDaemonSessionName>.sock: <temp>/acab-<16 hex>/s.sock, 29 bytes more
+// than the temp dir). When even that would not fit a unix socket path (a long
+// TMPDIR), it moves to /tmp, which is always short. The caller creates it
+// private (0700, ours; TakeScreenshotFile and the sidecar both check).
+base::FilePath SessionDir(const std::string& session_id,
+                          const base::FilePath& temp) {
+  const std::string name =
+      base::StrCat({"acab-", base::HexEncodeLower(
+                                 crypto::SHA256HashString(session_id))
+                                 .substr(0, 16)});
+  base::FilePath dir = temp.Append(name);
+  const base::FilePath socket =
+      dir.Append(base::StrCat({kDaemonSessionName, ".sock"}));
+  if (socket.value().size() <= kMaxSocketPathBytes) {
+    return dir;
+  }
+  return base::FilePath("/tmp").Append(name);
+}
+
 base::FilePath SessionDir(const std::string& session_id) {
   base::FilePath temp;
   if (!base::GetTempDir(&temp)) {
     temp = base::FilePath("/tmp");
   }
-  return temp.Append("acab").AppendASCII(session_id);
+  return SessionDir(session_id, temp);
 }
 
 // Reads and deletes `job.file_name` in <session_dir>/shots. The session and
