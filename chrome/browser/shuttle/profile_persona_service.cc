@@ -25,6 +25,12 @@ namespace shuttle {
 ProfilePersonaService::ProfilePersonaService(Profile* profile)
     : profile_(profile) {
   DropLegacyAgentPersonas();
+  StoreMigratedPersona();
+  // The run starts with the service: a managed Profile's bootstrap has
+  // committed its persona before services are created.
+  StoredFingerprintPersona initial = Lookup();
+  run_persona_unreadable_ = initial.state == StoredFingerprintPersona::State::kCorrupt;
+  run_persona_ = std::move(initial.persona);
 }
 
 ProfilePersonaService::~ProfilePersonaService() = default;
@@ -69,12 +75,31 @@ std::optional<FingerprintPersona> ProfilePersonaService::Get() const {
   return std::move(stored.persona);
 }
 
+const std::optional<FingerprintPersona>& ProfilePersonaService::RunPersona()
+    const {
+  DCHECK_CALLED_ON_VALID_SEQUENCE(sequence_checker_);
+  return run_persona_;
+}
+
+bool ProfilePersonaService::PendingRestart() const {
+  StoredFingerprintPersona stored = Lookup();
+  switch (stored.state) {
+    case StoredFingerprintPersona::State::kPersona:
+      return !run_persona_ || !(*run_persona_ == *stored.persona);
+    case StoredFingerprintPersona::State::kNone:
+      return run_persona_.has_value() || run_persona_unreadable_;
+    case StoredFingerprintPersona::State::kCorrupt:
+      // Nothing the next run could present either.
+      return !run_persona_unreadable_;
+  }
+  return false;
+}
+
 std::optional<std::string> ProfilePersonaService::AcceptLanguageHeader() const {
-  std::optional<FingerprintPersona> persona = Get();
-  if (!persona) {
+  if (!run_persona_) {
     return std::nullopt;
   }
-  return AcceptLanguageHeaderForPersona(*persona);
+  return AcceptLanguageHeaderForPersona(*run_persona_);
 }
 
 bool ProfilePersonaService::Set(const FingerprintPersona& persona) {
@@ -86,7 +111,16 @@ bool ProfilePersonaService::Set(const FingerprintPersona& persona) {
   }
   pref_service->SetDict(prefs::kFingerprintPersona,
                         FingerprintPersonaToPrefValue(persona));
-  NotifyChanged();
+  if (IsManaged()) {
+    // Only ever written between two runs (the Profile is stopped and its
+    // contexts are retired), so the next run starts with it.
+    run_persona_ = persona;
+    run_persona_unreadable_ = false;
+    NotifyChanged();
+  }
+  // An unmanaged Profile's run keeps its persona: a change while pages,
+  // iframes and workers live would split them between two identities. The
+  // next browser start presents it (PendingRestart()).
   return true;
 }
 
@@ -103,8 +137,9 @@ void ProfilePersonaService::Clear() {
                     "profile.";
     return;
   }
+  // Like Set on an unmanaged Profile: the run keeps its persona, the next
+  // browser start has none.
   pref_service->ClearPref(prefs::kFingerprintPersona);
-  NotifyChanged();
 }
 
 void ProfilePersonaService::NotifyChanged() {
@@ -118,7 +153,7 @@ bool ProfilePersonaService::ConfigureNetworkContextParams(
   if (!params) {
     return false;
   }
-  std::optional<FingerprintPersona> persona = Get();
+  const std::optional<FingerprintPersona>& persona = run_persona_;
   if (!persona) {
     if (IsManaged()) {
       // Defense in depth (the bootstrap does not let such a Profile load):
@@ -131,6 +166,16 @@ bool ProfilePersonaService::ConfigureNetworkContextParams(
   params->accept_language = AcceptLanguageHeaderForPersona(*persona);
   params->user_agent = persona->user_agent;
   return true;
+}
+
+void ProfilePersonaService::StoreMigratedPersona() {
+  StoredFingerprintPersona stored = Lookup();
+  if (stored.state != StoredFingerprintPersona::State::kPersona ||
+      !stored.version_migrated) {
+    return;
+  }
+  profile_->GetPrefs()->SetDict(prefs::kFingerprintPersona,
+                                FingerprintPersonaToPrefValue(*stored.persona));
 }
 
 void ProfilePersonaService::DropLegacyAgentPersonas() {

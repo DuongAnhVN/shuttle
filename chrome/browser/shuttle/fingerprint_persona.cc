@@ -17,28 +17,40 @@
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/string_split.h"
 #include "base/strings/string_util.h"
+#include "base/version.h"
+#include "base/version_info/version_info.h"
 
 namespace shuttle {
 
 namespace {
 
-// The browser version presets are generated with (tracks chrome/VERSION; the
-// persona stores its own copy, so a later bump doesn't change stored ones).
-constexpr char kDefaultBrowserVersion[] = "158.0.8127.18";
-constexpr int kDefaultBrowserMajor = 158;  // major of kDefaultBrowserVersion
-// The browser versions a persona may claim: Chrome's version scheme is
-// "major.0.build.patch" (the minor is always 0), and the engine under the
-// persona is kDefaultBrowserMajor, so a persona claiming a much newer Chrome
-// is not a browser that exists.
-constexpr int kMinBrowserMajor = 100;
-constexpr int kMaxBrowserMajor = kDefaultBrowserMajor + 2;
-constexpr int kMinBrowserBuild = 1000;
-constexpr int kMaxBrowserBuild = 99999;
-constexpr int kMaxBrowserPatch = 999;
-constexpr char kBrowserVersionError[] =
-    "browserVersion must look like 158.0.8127.18 (major 100 to 160, minor 0, "
-    "build 1000 to 99999, patch 0 to 999)";
+// The browser versions a persona may claim. Chrome's version scheme is
+// "major.0.build.patch" (the minor is always 0). A persona reports the Chrome
+// it runs on: TLS, HTTP/2 and the web features a page can detect all show the
+// real engine, so its major and branch build are this browser's
+// (version_info, from chrome/VERSION). Only the patch may differ, as between
+// releases of one branch.
+constexpr unsigned kMaxBrowserPatch = 999;
 constexpr char kBrowserBrand[] = "Chrome";
+
+// This browser's version, major and branch build ("158.0.8127.18": 158, 8127).
+const base::Version& EngineVersion() {
+  return version_info::GetVersion();
+}
+uint32_t EngineMajor() {
+  return EngineVersion().components()[0];
+}
+uint32_t EngineBuild() {
+  return EngineVersion().components()[2];
+}
+
+std::string BrowserVersionError() {
+  return base::StrCat(
+      {"browserVersion must be this browser's version ",
+       version_info::GetVersionNumber(), " (only the patch may differ: ",
+       base::NumberToString(EngineMajor()), ".0.",
+       base::NumberToString(EngineBuild()), ".<0 to 999>)"});
+}
 
 // Chrome stopped supporting macOS 11 with this major: a persona on a newer
 // Chrome cannot report an older macOS.
@@ -191,9 +203,11 @@ bool IsNumber(std::string_view text, size_t max_digits = 9) {
   return true;
 }
 
-// "158.0.8127.18": four numbers in Chrome's scheme (major.0.build.patch, see
-// kMinBrowserMajor and friends). `major` gets the first.
-bool ParseBrowserVersion(std::string_view version, std::string* major) {
+// Whether `version` has the shape of a Chrome version: four numbers,
+// "major.0.build.patch", patch 0 to 999. Says nothing about which Chrome.
+bool ParseBrowserVersionShape(std::string_view version,
+                              uint32_t* major,
+                              uint32_t* build) {
   std::vector<std::string_view> parts = base::SplitStringPiece(
       version, ".", base::KEEP_WHITESPACE, base::SPLIT_WANT_ALL);
   if (parts.size() != 4) {
@@ -204,21 +218,33 @@ bool ParseBrowserVersion(std::string_view version, std::string* major) {
       return false;
     }
   }
-  int major_number = 0;
-  int build = 0;
-  int patch = 0;
-  if (!base::StringToInt(parts[0], &major_number) ||
-      !base::StringToInt(parts[2], &build) ||
-      !base::StringToInt(parts[3], &patch)) {
+  unsigned major_number = 0;
+  unsigned build_number = 0;
+  unsigned patch = 0;
+  if (!base::StringToUint(parts[0], &major_number) ||
+      !base::StringToUint(parts[2], &build_number) ||
+      !base::StringToUint(parts[3], &patch)) {
     return false;
   }
-  if (major_number < kMinBrowserMajor || major_number > kMaxBrowserMajor ||
-      parts[1] != "0" || build < kMinBrowserBuild || build > kMaxBrowserBuild ||
-      patch > kMaxBrowserPatch) {
+  if (parts[1] != "0" || patch > kMaxBrowserPatch) {
+    return false;
+  }
+  *major = major_number;
+  *build = build_number;
+  return true;
+}
+
+// A version this browser may report: Chrome's shape with this browser's major
+// and branch build (see kMaxBrowserPatch). `major` gets the first number.
+bool ParseBrowserVersion(std::string_view version, std::string* major) {
+  uint32_t major_number = 0;
+  uint32_t build = 0;
+  if (!ParseBrowserVersionShape(version, &major_number, &build) ||
+      major_number != EngineMajor() || build != EngineBuild()) {
     return false;
   }
   if (major) {
-    *major = std::string(parts[0]);
+    *major = base::NumberToString(major_number);
   }
   return true;
 }
@@ -778,10 +804,9 @@ FingerprintPersona GenerateFingerprintPersona(
   persona.os = os;
   persona.platform = PlatformForOs(os);
   persona.browser_brand = kBrowserBrand;
-  persona.browser_version = kDefaultBrowserVersion;
-  std::string major;
-  ParseBrowserVersion(persona.browser_version, &major);
-  persona.user_agent = BuildUserAgent(os, major);
+  persona.browser_version = std::string(version_info::GetVersionNumber());
+  persona.user_agent =
+      BuildUserAgent(os, version_info::GetMajorVersionNumber());
   persona.client_hints.platform = ClientHintPlatformForOs(os);
   persona.client_hints.mobile = false;
   persona.client_hints.bitness = "64";
@@ -871,14 +896,14 @@ std::string CheckFingerprintPersona(const FingerprintPersona& persona) {
   }
   std::string major;
   if (!ParseBrowserVersion(persona.browser_version, &major)) {
-    return kBrowserVersionError;
+    return BrowserVersionError();
   }
   if (persona.user_agent != BuildUserAgent(persona.os, major)) {
     return "user agent does not match the os and the browser version";
   }
   int browser_major = 0;
   if (!base::StringToInt(major, &browser_major)) {
-    return kBrowserVersionError;
+    return BrowserVersionError();
   }
 
   const FingerprintPersona::ClientHints& hints = persona.client_hints;
@@ -1136,12 +1161,47 @@ StoredFingerprintPersona FingerprintPersonaFromPrefValue(
     }
   }
 
+  // A persona stored by a Shuttle on another Chrome branch moves onto this
+  // one (see NormalizeBrowserVersionToEngine); the caller writes it back.
+  stored.version_migrated = NormalizeBrowserVersionToEngine(&persona);
   if (!CheckFingerprintPersona(persona).empty()) {
+    stored.version_migrated = false;
     return stored;
   }
   stored.state = StoredFingerprintPersona::State::kPersona;
   stored.persona = std::move(persona);
   return stored;
+}
+
+void DropForeignBrowserVersion(base::DictValue& input) {
+  const std::string* version = input.FindString("browserVersion");
+  uint32_t major = 0;
+  uint32_t build = 0;
+  if (version && ParseBrowserVersionShape(*version, &major, &build) &&
+      !ParseBrowserVersion(*version, nullptr)) {
+    input.Remove("browserVersion");
+  }
+}
+
+bool NormalizeBrowserVersionToEngine(FingerprintPersona* persona) {
+  uint32_t major = 0;
+  uint32_t build = 0;
+  if (!ParseBrowserVersionShape(persona->browser_version, &major, &build) ||
+      (major == EngineMajor() && build == EngineBuild())) {
+    // Not a version at all (left to CheckFingerprintPersona: corrupt), or
+    // already this branch.
+    return false;
+  }
+  // A version migration must not turn an inconsistent stored record into
+  // a valid one by overwriting the evidence of corruption.
+  if (persona->user_agent !=
+      BuildUserAgent(persona->os, base::NumberToString(major))) {
+    return false;
+  }
+  persona->browser_version = std::string(version_info::GetVersionNumber());
+  persona->user_agent =
+      BuildUserAgent(persona->os, version_info::GetMajorVersionNumber());
+  return true;
 }
 
 base::DictValue FingerprintPersonaToMcpValue(
@@ -1226,7 +1286,7 @@ std::string ParseFingerprintPersonaInput(const base::Value& value,
     std::string major;
     if (!version->is_string() ||
         !ParseBrowserVersion(version->GetString(), &major)) {
-      return kBrowserVersionError;
+      return BrowserVersionError();
     }
     persona.browser_version = version->GetString();
     persona.user_agent = BuildUserAgent(persona.os, major);

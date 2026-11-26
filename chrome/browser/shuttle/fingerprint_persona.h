@@ -139,7 +139,25 @@ struct StoredFingerprintPersona {
   enum class State { kNone, kPersona, kCorrupt };
   State state = State::kNone;
   std::optional<FingerprintPersona> persona;  // set iff state == kPersona
+  // kPersona only: the stored value claimed another Chrome branch and
+  // `persona` was moved onto this browser's version
+  // (NormalizeBrowserVersionToEngine). The owner should store it back.
+  bool version_migrated = false;
 };
+
+// A persona reports the Chrome it runs on (major and branch build of this
+// browser; see CheckFingerprintPersona). A persona whose browser version has
+// Chrome's shape but another major or build (stored by a Shuttle on another
+// branch) gets this browser's version, and its user agent follows. Returns
+// whether it changed. A malformed version is left alone (it stays an error).
+bool NormalizeBrowserVersionToEngine(FingerprintPersona* persona);
+
+// For a set-fingerprint input that was stored before (a managed profile's
+// persona intent in the registry), not for new input: a `browserVersion` of
+// another Chrome branch is removed, so the persona gets this browser's version
+// the way a stored persona does (NormalizeBrowserVersionToEngine). New input
+// with such a version is refused by ParseFingerprintPersonaInput.
+void DropForeignBrowserVersion(base::DictValue& input);
 
 // "windows-chrome", "macos-chrome", "linux-chrome".
 bool IsKnownFingerprintPreset(std::string_view preset);
@@ -177,8 +195,9 @@ FingerprintPersona GenerateFingerprintPersona(
     const FingerprintGenerationOptions& options);
 
 // Whether the values of `persona` agree with each other: version, preset/os/
-// platform, user agent against os and browser version (Chrome's version
-// scheme), client hints against os (platform version range, architecture,
+// platform, browser version against this browser (same major and branch
+// build, only the patch may differ), user agent against os and browser
+// version, client hints against os (platform version range, architecture,
 // bitness, desktop only), languages against locale (known language, locale
 // first, region before base), hardware and screen against os and architecture
 // (Apple Silicon minimums, desktop minimums, pixel ratios), and WebGL against

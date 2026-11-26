@@ -94,6 +94,7 @@ struct ProfileRecord {
   std::string lifecycle;
   bool loaded = false;
   bool deletion_pending = false;
+  bool persona_replacement_pending = false;
   // JSON of personaSummary (no seed), "" = null.
   std::string persona_summary_json;
   std::string last_error_code;

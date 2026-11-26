@@ -786,6 +786,7 @@ ProfileRecord BrowserProfileRouter::MakeRecord(
   record.loaded = manager && manager->GetProfileByPath(
                                  PathForDirectory(entry.directory)) != nullptr;
   record.deletion_pending = entry.deletion_pending;
+  record.persona_replacement_pending = entry.persona_replacement_pending;
   // Committed summary (no seed); before the first load, the validated input.
   record.persona_summary_json = entry.persona_summary_json.empty()
                                     ? entry.persona_input_json
@@ -1181,6 +1182,9 @@ void BrowserProfileRouter::OnLoadedContextsRetired(
     if (!ManagedProfilePersonaMatchesIntent(profile.get(), intent)) {
       auto input = base::JSONReader::ReadDict(entry->persona_input_json,
                                             base::JSON_PARSE_RFC);
+      if (input) {
+        DropForeignBrowserVersion(*input);
+      }
       FingerprintPersona persona;
       auto* service = ProfilePersonaServiceFactory::GetForProfileIfExists(profile.get());
       if (!input || !service ||
@@ -1973,6 +1977,9 @@ void BrowserProfileRouter::ApplyPersonaAfterRetirement(
       ProfilePersonaServiceFactory::GetForProfileIfExists(loaded.get());
   std::optional<base::DictValue> input = base::JSONReader::ReadDict(
       intent, base::JSON_PARSE_RFC);
+  if (input) {
+    DropForeignBrowserVersion(*input);
+  }
   FingerprintPersona persona;
   const bool ok =
       service && input &&

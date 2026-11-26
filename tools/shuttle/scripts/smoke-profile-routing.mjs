@@ -99,6 +99,12 @@ refused('stopped A is profile_not_ready for scoped calls', await adminCall('list
 // Persona replacement while STOPPED (contract section 7): the only tool a stopped profile accepts. It does not load
 // the profile, moves the lifecycle epoch, never clears cookies, never touches B.
 const set = await adminCall('set-fingerprint', { fingerprint: fpA }, { profile: A.key });
+const cold = await adminCall('set-fingerprint', { fingerprint: fpA }, { profile: S.key });
+check('an unloaded profile queues the replacement for its next load',
+  cold.ok && cold.data.applied === false && cold.data.pendingRestart === true);
+check('the stopped profile reports the durable replacement state',
+  set.ok && set.data.applied === stopA.data.profile.loaded &&
+  set.data.pendingRestart === !stopA.data.profile.loaded);
 check('set-fingerprint on a stopped profile works', set.ok && set.data.fingerprint?.timezone === 'Europe/Rome', `${set.error?.code ?? set.error?.message ?? ''}`);
 check('set-fingerprint answer carries no seed', !/seed/i.test(JSON.stringify(set.data ?? '')));
 const recA = (await adminCall('list-browser-profiles')).data.profiles.find((p) => p.coreProfileKey === A.key);
@@ -114,7 +120,9 @@ const reloadA = await adminCall('load-browser-profile', { coreProfileKey: A.key 
 check('A reloads at a new lifecycle epoch', reloadA.ok && reloadA.data.profile.lifecycleEpoch > stopA.data.profile.lifecycleEpoch, `${reloadA.error?.code ?? ''}`);
 const stale = await adminCall('list-tabs', { sessionId: s2.sessionId }, { profile: A.key });
 check("A's pre-stop session is gone after restart (stale handle)", !stale.ok, `${stale.error?.message ?? 'REVIVED'}`.slice(0, 80));
-const fpAfter = (await adminCall('get-fingerprint', {}, { profile: A.key })).data?.fingerprint;
+const activeAfter = (await adminCall('get-fingerprint', {}, { profile: A.key })).data;
+check('the loaded profile has no pending replacement', activeAfter?.pendingRestart === false);
+const fpAfter = activeAfter?.fingerprint;
 check('the replaced persona is what the reloaded profile presents', fpAfter?.timezone === 'Europe/Rome' && fpAfter?.locale === 'it-IT', JSON.stringify([fpAfter?.timezone, fpAfter?.locale]));
 
 // Concurrent lifecycle calls on one key are serialized, never a torn state.

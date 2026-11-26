@@ -344,12 +344,20 @@ base::Value DescribeFingerprint(const ToolContext& context) {
 void GetFingerprint(const ToolContext& context,
                     const base::DictValue& args,
                     ToolCallback callback) {
-  if (!PersonaServiceOf(context)) {
+  ProfilePersonaService* service = PersonaServiceOf(context);
+  if (!service) {
     std::move(callback).Run(ToolResult::Error(kNoPersonaService));
     return;
   }
+  base::Value active;
+  if (const auto& persona = service->RunPersona()) {
+    active = base::Value(FingerprintPersonaToMcpValue(*persona));
+  } else if (service->RunPersonaUnreadable()) {
+    active = base::Value(base::DictValue().Set("unreadable", true));
+  }
   std::move(callback).Run(ToolResult::Json(base::Value(
-      base::DictValue().Set("fingerprint", DescribeFingerprint(context)))));
+      base::DictValue().Set("fingerprint", std::move(active))
+                       .Set("pendingRestart", service->PendingRestart()))));
 }
 
 void SetFingerprint(const ToolContext& context,
@@ -380,7 +388,9 @@ void SetFingerprint(const ToolContext& context,
   if (value->is_none()) {
     service->Clear();
     std::move(callback).Run(ToolResult::Json(base::Value(
-        base::DictValue().Set("fingerprint", base::Value()))));
+        base::DictValue().Set("fingerprint", base::Value())
+            .Set("applied", !service->PendingRestart())
+            .Set("pendingRestart", service->PendingRestart()))));
     return;
   }
   // Setting keeps the profile's readable persona's seed (a stable identity;
@@ -419,7 +429,9 @@ void SetFingerprint(const ToolContext& context,
     return;
   }
   std::move(callback).Run(ToolResult::Json(base::Value(
-      base::DictValue().Set("fingerprint", DescribeFingerprint(context)))));
+      base::DictValue().Set("fingerprint", DescribeFingerprint(context))
+            .Set("applied", !service->PendingRestart())
+            .Set("pendingRestart", service->PendingRestart()))));
 }
 
 // Persistent agents (not throwaway), oldest first, then by id.
@@ -1590,7 +1602,7 @@ constexpr char kListAgentsArgs[] = R"({"type":"object","properties":{
 // A raw string with its own delimiter: the descriptions contain ")" followed
 // by a quote (e.g. "Google Inc. (NVIDIA)"), which would end an R"(...)" one.
 constexpr char kSetFingerprintArgs[] = R"json({"type":"object","properties":{
-  "fingerprint":{"type":["object","null"],"description":"The ONE fingerprint persona of the browser profile, shared by every tab, agent and storage partition (not per agent). null clears it. With preset, a new persona is generated (it keeps the profile's stable identity across presets; clear it first for a new one) and the other fields override it; without preset, the other fields change the current persona. Applied profile-wide to every tab, agent and partition: user agent, client hints, Accept-Language and navigator.language(s), navigator.platform, hardwareConcurrency, deviceMemory, screen size and color depth, devicePixelRatio, and, when given, the WebGL unmasked vendor and renderer. A page keeps what it loaded with until its next navigation or reload; Accept-Language of requests follows at once; the network contexts' own user agent changes at the next browser start. The timezone and locale are applied as the renderer process' ICU defaults, so Date, getTimezoneOffset, toLocale*String and Intl.* follow (open tabs at once; the timezone must be a known IANA id); ICU's defaults are process-global, so this changes every page and dedicated worker of the profile's renderer processes (content does not share a renderer process between profiles; not tested here; with --single-process the two values are not applied at all), not shared/service workers in their own processes, and a DevTools Emulation timezone/locale override still wins while set. Not applied: canvas, audio, fonts, media, form-control locale; WebRTC is only the native IP handling policy of proxied agents/profiles, never spoofed; other workers are not covered.","additionalProperties":false,"properties":{"preset":{"type":"string","enum":["windows-chrome","macos-chrome","linux-chrome"]},"browserVersion":{"type":"string","description":"Chrome's scheme major.0.build.patch, major 100-160, e.g. 158.0.8127.18; the user agent follows."},"locale":{"type":"string","description":"e.g. en-US; languages follows unless given."},"languages":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8,"description":"navigator.languages; the first one is the locale."},"timezone":{"type":"string","description":"IANA id, e.g. Europe/Paris."},"hardwareConcurrency":{"type":"integer","description":"2-64."},"deviceMemory":{"type":"number","enum":[0.25,0.5,1,2,4,8],"description":"GB; a desktop persona needs at least 2 (smaller values are refused), 8 for an Apple Silicon Mac or more than 16 cores."},"screen":{"type":"object","additionalProperties":false,"properties":{"width":{"type":"integer"},"height":{"type":"integer"},"devicePixelRatio":{"type":"number","description":"1-4 in steps of 0.25."},"colorDepth":{"type":"integer","enum":[24,30]}}},"webgl":{"type":["object","null"],"description":"Optional. What getParameter(UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL) returns (WEBGL_debug_renderer_info), nothing else of WebGL (no limits, extensions, GLSL or version strings, rendering output). Chrome/ANGLE-shaped strings that must fit the os (Windows: Direct3D, macOS: Metal, Linux: OpenGL or Vulkan). Not generated by a preset: a preset clears it. null clears it.","additionalProperties":false,"properties":{"vendor":{"type":"string","description":"e.g. Google Inc. (NVIDIA)"},"renderer":{"type":"string","description":"e.g. ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"}}}}}},
+  "fingerprint":{"type":["object","null"],"description":"The ONE fingerprint persona of the browser profile, shared by every tab, agent and storage partition (not per agent). null clears it. With preset, a new persona is generated (it keeps the profile's stable identity across presets; clear it first for a new one) and the other fields override it; without preset, the other fields change the current persona. Applied profile-wide to every tab, agent and partition: user agent, client hints, Accept-Language and navigator.language(s), navigator.platform, hardwareConcurrency, deviceMemory, screen size and color depth, devicePixelRatio, and, when given, the WebGL unmasked vendor and renderer. Changes are stored for the next run. Read get-fingerprint for the active persona and pendingRestart. Not applied: canvas, audio, fonts, media, form-control locale; WebRTC is only the native IP handling policy of proxied agents/profiles, never spoofed; other workers are not covered.","additionalProperties":false,"properties":{"preset":{"type":"string","enum":["windows-chrome","macos-chrome","linux-chrome"]},"browserVersion":{"type":"string","description":"Defaults to the engine version. An explicit version must match the engine major and build."},"locale":{"type":"string","description":"e.g. en-US; languages follows unless given."},"languages":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8,"description":"navigator.languages; the first one is the locale."},"timezone":{"type":"string","description":"IANA id, e.g. Europe/Paris."},"hardwareConcurrency":{"type":"integer","description":"2-64."},"deviceMemory":{"type":"number","enum":[0.25,0.5,1,2,4,8],"description":"GB; a desktop persona needs at least 2 (smaller values are refused), 8 for an Apple Silicon Mac or more than 16 cores."},"screen":{"type":"object","additionalProperties":false,"properties":{"width":{"type":"integer"},"height":{"type":"integer"},"devicePixelRatio":{"type":"number","description":"1-4 in steps of 0.25."},"colorDepth":{"type":"integer","enum":[24,30]}}},"webgl":{"type":["object","null"],"description":"Optional. What getParameter(UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL) returns (WEBGL_debug_renderer_info), nothing else of WebGL (no limits, extensions, GLSL or version strings, rendering output). Chrome/ANGLE-shaped strings that must fit the os (Windows: Direct3D, macOS: Metal, Linux: OpenGL or Vulkan). Not generated by a preset: a preset clears it. null clears it.","additionalProperties":false,"properties":{"vendor":{"type":"string","description":"e.g. Google Inc. (NVIDIA)"},"renderer":{"type":"string","description":"e.g. ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)"}}}}}},
   "required":["fingerprint"]})json";
 
 constexpr Tool kTools[] = {
@@ -1604,22 +1616,13 @@ constexpr Tool kTools[] = {
     {"get-fingerprint",
      "The ONE fingerprint persona of the browser profile, shared by every tab "
      "and agent: {fingerprint: null | the persona without its seed | "
-     "{unreadable: true}}.",
+     "{unreadable: true}, pendingRestart: boolean}.",
      kNoArgs, &GetFingerprint},
     {"set-fingerprint",
      "Set (or clear with null) the ONE fingerprint persona of the browser "
      "profile: the device every tab of every agent presents (user agent, "
      "client hints, languages, platform, cores, memory, screen, time zone "
-     "and locale). Open tabs' time zone (Date, Intl), locale and renderer "
-     "values follow at once; user agent, client hints and "
-     "navigator.language(s) apply to a page from its next navigation or "
-     "reload; Accept-Language of network requests follows at once. The "
-     "network contexts' own user agent changes only when they are created "
-     "again (browser restart). Time zone/locale are applied per renderer "
-     "process (ICU defaults are process-global; content keeps a profile's "
-     "renderer processes separate, none in --single-process): pages and "
-     "dedicated workers are covered, shared/service workers in their own "
-     "processes are not guaranteed.",
+     "and locale). The result includes applied and pendingRestart. A changed persona takes effect on the next run.",
      kSetFingerprintArgs, &SetFingerprint},
     {"create-agent",
      "Create an agent: an identity shown on its tabs, and its own "

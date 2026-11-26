@@ -79,7 +79,7 @@ if (corruptMode) {
   const repaired = await setFp({ preset: 'linux-chrome' });
   check('a preset replaces an unreadable persona', repaired.fingerprint?.os === 'linux' && repaired.fingerprint?.platform === 'Linux x86_64', JSON.stringify(repaired.fingerprint ?? repaired.error).slice(0, 120));
   await setFp(null);
-  check('null clears the persona', (await getFp()) === null);
+  check('clearing keeps the unreadable active persona for this run', same(await getFp(), { unreadable: true }));
   await finish();  // exits the process
 }
 
@@ -112,7 +112,7 @@ check('overrides applied (locale, languages follow it, timezone, cores, memory, 
 check('user agent is the reduced Mac one for the browser version',
   fp?.userAgent === `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${fp.browser.version.split('.')[0]}.0.0.0 Safari/537.36`, fp?.userAgent);
 check('set-fingerprint output has no seed', !('seed' in (fp ?? {})) && !JSON.stringify(created).toLowerCase().includes('"seed"'));
-check('get-fingerprint returns the persona just set', same(await getFp(), fp));
+check('set saves for restart while get reports the active persona', created.applied === false && created.pendingRestart === true && same(await getFp(), seeded));
 
 // Profile-level storage; the seed is only in Preferences (written lazily).
 let seedA;
@@ -129,10 +129,10 @@ if (prefsFile) {
 }
 
 // Patch (no preset): only the given fields change; the rest and the seed stay.
-const patched = await setFp({ timezone: 'Asia/Tokyo', browserVersion: '157.0.7000.1' });
+const patched = await setFp({ timezone: 'Asia/Tokyo' });
 const pfp = patched.fingerprint;
 check('patch without a preset changes only the given fields',
-  pfp?.timezone === 'Asia/Tokyo' && pfp.browser?.version === '157.0.7000.1' && pfp.userAgent?.includes('Chrome/157.0.0.0') && pfp.os === 'macos' &&
+  pfp?.timezone === 'Asia/Tokyo' && pfp.browser?.version === fp.browser?.version && pfp.os === 'macos' &&
   pfp.locale === 'fr-FR' && pfp.hardwareConcurrency === 10 && pfp.screen?.width === 1512, JSON.stringify(patched.error ?? pfp).slice(0, 160));
 const patchedLocale = await setFp({ locale: 'de-DE' });
 check('patching the locale moves the languages with it', patchedLocale.fingerprint?.locale === 'de-DE' && same(patchedLocale.fingerprint?.languages, ['de-DE', 'de']),
@@ -156,7 +156,7 @@ check('same preset again is deterministic for the profile (same seed gives the s
 
 // Clear, then set again: a new seed.
 const cleared = await setFp(null);
-check('null clears the persona', cleared.fingerprint === null && (await getFp()) === null, JSON.stringify(cleared.fingerprint ?? cleared.error));
+check('null clears the persona', cleared.fingerprint === null && same(await getFp(), seeded), JSON.stringify(cleared.fingerprint ?? cleared.error));
 if (prefsFile) {
   check('cleared persona is removed from Preferences', await waitUntil(() => storedPersona() === undefined, 15000), JSON.stringify(storedPersona() ?? null).slice(0, 80));
 }
@@ -170,7 +170,7 @@ const missing = await call('set-fingerprint', {});
 check('set-fingerprint without the argument is refused', !!missing.error && /fingerprint/.test(missing.error), missing.error ?? 'accepted');
 
 // 3. Rejections: nothing is changed.
-const before = await getFp();
+const before = again.fingerprint;
 const REJECT = [
   ['unknown preset', { preset: 'beos-chrome' }, /preset/],
   ['non-string preset', { preset: 5 }, /preset/],
@@ -222,7 +222,7 @@ for (const [what, value, re] of REJECT) {
   const r = await setFp(value);
   check(`set-fingerprint rejects ${what}`, !!r.error && r.error.startsWith('fingerprint: ') && re.test(r.error), r.error ?? 'accepted');
 }
-check('rejected updates changed nothing', same(await getFp(), before));
+check('rejected updates left the saved persona intact', same((await setFp({})).fingerprint, before));
 const notObject = await setFp('windows-chrome');
 check('set-fingerprint rejects a non-object fingerprint', !!notObject.error && notObject.error.startsWith('fingerprint: '), notObject.error ?? 'accepted');
 await setFp(null);
@@ -273,7 +273,7 @@ if (plain.error) {
   skipCheck('throwaway agent shares the profile persona', plain.error);
 } else {
   made.push(plain.id);
-  check('a throwaway agent reports no persona and the profile keeps its one', !('fingerprint' in plain) && (await getFp())?.os === 'windows');
+  check('a throwaway agent reports no persona and the profile keeps its one', !('fingerprint' in plain) && same(await getFp(), seeded));
 }
 
 // 5. The seed: in Preferences, in no MCP output.

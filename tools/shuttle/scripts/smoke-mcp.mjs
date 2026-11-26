@@ -62,6 +62,10 @@ async function cookiesOf(agent) {
 }
 
 if (phase === '--phase2') {
+  const fingerprint = await tool('get-fingerprint');
+  check(fingerprint.fingerprint?.preset === 'linux-chrome' && fingerprint.fingerprint?.locale === 'fr-FR' && fingerprint.pendingRestart === false,
+    'saved fingerprint becomes active after restart', JSON.stringify(fingerprint));
+  await tool('set-fingerprint', { fingerprint: null });
   const cp = await cookiesOf('smoke-persist');
   check(!cp.error, 'open-session smoke-persist', cp.error);
   check(cp.v === 'persist', 'cookie survived restart', JSON.stringify(cp));
@@ -79,6 +83,14 @@ if (phase === '--phase2') {
   }
   await finish();
 }
+
+// Save a persona for the next browser run and verify the active one stays put.
+const activeFingerprint = await tool('get-fingerprint');
+const savedFingerprint = await tool('set-fingerprint', { fingerprint: { preset: 'linux-chrome', locale: 'fr-FR' } });
+const unchangedFingerprint = await tool('get-fingerprint');
+check(savedFingerprint.fingerprint?.locale === 'fr-FR' && savedFingerprint.applied === false && savedFingerprint.pendingRestart === true &&
+  JSON.stringify(unchangedFingerprint.fingerprint) === JSON.stringify(activeFingerprint.fingerprint) && unchangedFingerprint.pendingRestart === true,
+  'fingerprint saved for restart while active persona remains unchanged', JSON.stringify(savedFingerprint));
 
 // Protocol.
 const init = await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'smoke', version: '1' } });

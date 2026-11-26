@@ -121,7 +121,7 @@ void ApplyProfilePersonaToWebContents(Profile* profile,
   if (!service) {
     return;
   }
-  std::optional<FingerprintPersona> persona = service->Get();
+  std::optional<FingerprintPersona> persona = service->RunPersona();
   auto* state = static_cast<PersonaTabState*>(
       contents->GetUserData(&kPersonaTabStateKey));
   if (!state) {
@@ -156,7 +156,7 @@ void ApplyProfilePersonaToWorkerPrefs(Profile* profile,
   ProfilePersonaService* service =
       ProfilePersonaServiceFactory::GetForProfileIfExists(profile);
   if (std::optional<FingerprintPersona> persona =
-          service ? service->Get() : std::nullopt) {
+          service ? service->RunPersona() : std::nullopt) {
     ApplyPersonaToRendererPrefs(*persona, prefs);
     // Workers never read these two (only Page does, as process-wide ICU
     // defaults); a worker's process may not even be tied to a page, so they

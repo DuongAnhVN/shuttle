@@ -270,8 +270,11 @@ void ReplaceManagedPersona(BrowserProfileRouter* router,
             std::move(callback).Run(
                 kHttpOk, kJson,
                 ResultMessage(
-                    id, ToolResult::Json(base::Value(base::DictValue().Set(
-                                             "fingerprint", std::move(summary))))
+                    id, ToolResult::Json(base::Value(
+                        base::DictValue()
+                            .Set("fingerprint", std::move(summary))
+                            .Set("applied", !result->persona_replacement_pending)
+                            .Set("pendingRestart", result->persona_replacement_pending)))
                             .ToValue()));
           },
           id.Clone(), std::move(callback)));

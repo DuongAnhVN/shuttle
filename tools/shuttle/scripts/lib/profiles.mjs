@@ -47,7 +47,7 @@ export async function requireIsolated() {
   return caps;
 }
 
-const PERSONA = { preset: 'linux-chrome', browserVersion: '150.0.7000.1', locale: 'fr-FR', languages: ['fr-FR', 'fr'], timezone: 'Asia/Tokyo',
+const PERSONA = { preset: 'linux-chrome', locale: 'fr-FR', languages: ['fr-FR', 'fr'], timezone: 'Asia/Tokyo',
   hardwareConcurrency: 6, deviceMemory: 4, screen: { width: 1366, height: 768, devicePixelRatio: 1, colorDepth: 24 } };
 export const persona = (patch = {}) => ({ ...PERSONA, ...patch });
 

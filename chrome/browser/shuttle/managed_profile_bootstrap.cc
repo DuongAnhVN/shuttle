@@ -275,6 +275,7 @@ class Bootstrap : public base::RefCounted<Bootstrap> {
     if (!input) {
       return BrowserProfileError::kPersonaInvalid;
     }
+    DropForeignBrowserVersion(*input);
     FingerprintPersona persona;
     std::string parse_error = ParseFingerprintPersonaInput(
         base::Value(std::move(*input)), /*current=*/nullptr, RandomSeed(),
@@ -310,6 +311,7 @@ class Bootstrap : public base::RefCounted<Bootstrap> {
       if (!input) {
         return BrowserProfileError::kPersonaInvalid;
       }
+      DropForeignBrowserVersion(*input);
       FingerprintPersona persona;
       std::string error = ParseFingerprintPersonaInput(
           base::Value(std::move(*input)), /*current=*/nullptr, RandomSeed(),
@@ -496,6 +498,7 @@ bool ManagedProfilePersonaMatchesIntent(Profile* profile,
       stored.state != StoredFingerprintPersona::State::kPersona) {
     return false;
   }
+  DropForeignBrowserVersion(*input);
   FingerprintPersona expected;
   return ParseFingerprintPersonaInput(base::Value(std::move(*input)), nullptr,
                                       stored.persona->seed, &expected).empty() &&
