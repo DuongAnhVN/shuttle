@@ -41,6 +41,7 @@
 #include "base/time/time.h"
 #include "build/build_config.h"
 #include "chrome/browser/shuttle/agent_browser_sidecar.h"
+#include "chrome/browser/shuttle/captcha_registry.h"
 #include "chrome/browser/shuttle/network_access.h"
 #include "chrome/browser/shuttle/profile_registry.h"
 #include "chrome/browser/shuttle/scope_auth.h"
@@ -130,6 +131,19 @@ re2::RE2::Options PatternOptions() {
 // when another element covers it (sticky headers/trays near the edges).
 bool RetriesWhenCovered(std::string_view tool) {
   return tool == "click" || tool == "dblclick" || tool == "hover";
+}
+
+// The CAPTCHA tab lock (captcha-contract.md section 2): these page tools
+// change the page and are refused while a challenge on the tab is being
+// captured or solved; the read tools (snapshot, get-text, screenshot,
+// console, errors, wait-for, find) keep working.
+bool IsMutatingTool(std::string_view tool) {
+  constexpr std::string_view kMutating[] = {
+      "click",   "dblclick", "hover",  "fill",    "type",
+      "press",   "select",   "check",  "uncheck", "scroll",
+      "open",    "back",     "forward", "reload", "eval", "state-load",
+  };
+  return std::ranges::find(kMutating, tool) != std::ranges::end(kMutating);
 }
 
 // Maps our arguments to agent-browser's. Returns an error message or "".
@@ -831,6 +845,21 @@ void PageToolManager::Call(std::string_view name,
     std::move(callback).Run(ToolResult::Error(
         "Not a leased tab of an open session: " + *target_id));
     return;
+  }
+  // The CAPTCHA tab lock: mutating tools are refused while a solve runs on
+  // this tab (contract section 2); reads keep working.
+  const std::string* find_action = args.FindString("action");
+  const bool mutating_find = name == "find" && find_action &&
+                             *find_action != "text";
+  if (IsMutatingTool(name) || mutating_find) {
+    if (const std::string status = CaptchaRegistry::Get().LockStatusOf(
+            contents);
+        !status.empty()) {
+      std::move(callback).Run(ToolResult::Error(base::StrCat(
+          {"captcha-in-progress: ", name,
+            " is refused while the tab's CAPTCHA is in state ", status})));
+      return;
+    }
   }
 
   if (const std::string* ab_special =

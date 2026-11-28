@@ -238,6 +238,71 @@ at the next browser start (page requests carry the new one already).
 - `create-agent` / `update-agent` **refuse** a `fingerprint` argument with an error naming `set-fingerprint`; the earlier
   per-agent form never shipped and is not kept. A persona stored per agent by that draft is ignored and removed.
 
+## CAPTCHA native detection (fork 66, not yet compiled)
+
+The browser detects and solves "puzzle-slide" CAPTCHAs itself, with **no DevTools/CDP** in the path: detection runs
+through `RenderFrameHost::ExecuteJavaScriptInIsolatedWorld` (an embedder-range isolated world,
+`content::ISOLATED_WORLD_ID_CONTENT_END`), the drag through trusted
+`blink::WebInputEvent`s forwarded on the frame's widget host. The wire format is frozen in the shared contract
+(`captcha-contract.md`, kept with the Manager); this section is the tool surface. Code: `chrome/browser/shuttle/`
+(`captcha_rules`, `captcha_detector`, `captcha_registry`, `captcha_tools`, `captcha_collector`, `captcha_executor`).
+Rules are Manager-owned: the browser holds the last applied snapshot in memory only (no disk, no pref), and Manager
+policy (`detect-only` vs `auto-solve`, provider, attempts) never reaches the browser.
+
+- **`set-captcha-rules {revision, rules}`**: replaces the whole snapshot atomically. Strict parser: ids
+  `^[a-z0-9][a-z0-9-]{0,62}$`, ≤ 32 rules, ≤ 64 KB JSON, `type: "puzzle-slide"` only, hosts exact or `*.` suffixes
+  (no scheme/port/path), path prefixes start with `/`, selectors are ≤ 200 chars of pure data (no control characters;
+  they reach the page only as JSON string literals inside `querySelector` in `try/catch`, never as code — a rule has
+  no JavaScript field anywhere), unknown keys rejected. Invalid → `{ok:false, error:"invalid-rules",
+  details:[{ruleId?,error}]}` and the old snapshot stays. A lower revision than applied → `stale-revision` unless the
+  revision less than or equal to the applied revision with different content → `stale-revision`. Success:
+  `{ok:true, revision, applied}`. Replacing retires challenges whose rule vanished.
+- **`get-captcha-rules {}`**: `{revision, applied, enabledCount, lastError?}`.
+- **`probe-captcha {targetId}`**: one detection pass, detect only: `{targetId, frames:[{url, ruleId?,
+  state:"none"|"candidate"|"ready"|"excluded", missing?}]}`. The URL gate (rule page/frame hosts and path prefixes)
+  runs in the browser; the in-frame check reads root/required/excluded/visibility/image-loaded there.
+- **`wait-captcha-events {cursor?, waitMs? 0..30000, default 20000}`**: long-poll of the browser's event ring (256
+  kept): `{events:[{seq, at, type: "challenge-ready"|"challenge-gone"|"solve-started"|"solve-finished", challengeId,
+  targetId, ruleId, kind:"puzzle-slide", outcome?, reason?}], cursor, bootId, dropped?}`. `cursor` is the last `seq`
+  returned. `bootId` identifies this browser process and remains stable; `dropped` counts events missed for that cursor.
+  Events never carry images, solutions or keys.
+- **`get-captcha-challenge {challengeId}`**: the captured state of one live challenge: `{challengeId, targetId,
+  ruleId, type:"puzzle-slide", stateRevision, capturedAt, images:{role:{mime,b64,width,height,source}},
+  instruction|null, geometry:{role:{x,y,width,height}} (CSS px in the frame viewport at capture), frameUrl}`. Missing
+  and gone challenges are tool errors whose text starts `challenge-not-found: ` or `challenge-gone: `; capturing is
+  likewise a tool error. Only this tool returns images; the internal state
+  digest never leaves the browser.
+- **`solve-captcha-challenge {challengeId, stateRevision, solution:{slideXProportion}, verifyTimeoutMs? (default
+  6000), deadlineMs? (default 15000)}`**: rechecks freshness (a changed picture answers `stale` with **no input
+  sent**), computes the contract's travel maths (`ratio`: `p·bgW·(trackW−handleW)/(bgW−pieceW)`, clamped; `direct`:
+  `p·bgW`), drags handle-centre → centre+travel with 14 eased moves and a 120 ms hold, then polls the rule's
+  failure/success markers. Returns the `Outcome` (`verified|rejected|stale|expired|unconfirmed|unsupported|error`,
+  `acted`, `verified`, `reason`, `timings`, `detail`). The mouse button is always released (finish, cancel, deadline,
+  frame or tab death).
+- **`cancel-captcha-challenge {challengeId}`**: releases the button, answers the running solve `error/cancelled`,
+  unlocks the tab: `{ok:true, state}`.
+- **Tab lock**: while a challenge is `solving`/`executing`/`verifying`, the mutating page tools (click, dblclick,
+  hover, fill, type, press, select, check, uncheck, scroll, open, back, forward, reload, eval, state-load, and `find`
+  when its action is click/fill/check/hover) and session CDP
+  `Input.*` / `Page.navigate`/`reload`/`goBack`/`goForward` on that tab answer `captcha-in-progress` (with the state);
+  `verifying` is reported as `executing`; reads (`snapshot`, `get-text`, `screenshot`, `console`, `errors`, `wait-for`,
+  `find` with action `text`) keep working. Released on
+  finish, cancel, deadline and tab close.
+- **Detection cadence** (documented in `captcha_detector.h`): a debounced pass per load/navigation event plus a
+  per-tab timer — 500 ms for 30 s after a candidate (or a load), then 2 s. MutationObserver cannot wake the browser
+  without a Mojo channel this feature must not add, and `ExecuteJavaScriptInIsolatedWorld` does not await promises,
+  so timers carry the re-checks. `targetId` is the same leased-tab id every other tool and CDP URL uses
+  (`SessionManager::TargetIdOf`).
+- `challengeId` is opaque (`ch_<hex>`), one per live (tab, frame, widget) instance; an image change re-fires
+  `challenge-ready` for the SAME id with `stateRevision` + 1; a solve with an older revision, or a fresh digest that
+  differs from the stored one, is `stale` (`acted:false`). A gone widget/frame/tab speaks `challenge-gone`.
+- Access class: all seven CAPTCHA tools require an admin in multi-profile mode because the registry is browser-wide;
+  legacy single-profile mode remains unchanged.
+- Observation: leased tabs are observed at lease creation and forgotten on lease removal; request-time observation
+  remains a fallback.
+- Probe: `smoke-captcha-detect.mjs` (fixtures on two local ports; no sidecar, and no CDP is used by the feature
+  itself — the probe only uses session CDP to prove the tab lock refuses input).
+
 ## Isolated Chromium Profiles (`--shuttle-isolated-profiles`, lane B2, not yet compiled)
 
 Opt-in and off by default. Contract: `PROFILES.md` (frozen; this section only says how the core implements it). Without

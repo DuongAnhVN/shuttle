@@ -3,7 +3,7 @@
 # from DevToolsActivePort), runs the probes, closes the browser itself (Browser.close, bounded wait, kill -9 only of
 # the PID it started), checks the exit status and the log for fatals, removes its temp dir, prints PASS/FAIL/SKIP.
 # Usage: scripts/smoke-all.sh <binary|Shuttle.app> [--with network,push,automation,profiles] [--mode headless|x11|wayland]
-#   Default: cdp, session-cdp, agents-page, isolation (agent storage across blank tabs), focus, sandbox (Linux only: the page is not built on macOS), mcp phase 1,
+#   Default: cdp, session-cdp, agents-page, isolation (agent storage across blank tabs), captcha-detect (the seven CAPTCHA tools, no sidecar), focus, sandbox (Linux only: the page is not built on macOS), mcp phase 1,
 #   restart on the same profile, mcp phase 2, tab-guards, page-tools (2x), throwaway, proxy, fingerprint-persona. Opt-in: network (own launch with --shuttle-listen=0.0.0.0, LAN),
 #   push (needs SHUTTLE_SMOKE_NET=1, else SKIP), automation (own launch: --enable-automation, no debug port; binds
 #   9222 when free, else a free port). x11/wayland use the WSLg defaults (DISPLAY=:0, /mnt/wslg/runtime-dir) unless
@@ -97,6 +97,7 @@ if launch "$tmp/profile" --remote-debugging-port=0 ${extra[@]+"${extra[@]}"}; th
   probe session-cdp 120 smoke-session-cdp.mjs
   probe agents-page 120 smoke-agents-page.mjs
   probe isolation 60 smoke-isolation.mjs
+  probe captcha-detect 240 smoke-captcha-detect.mjs  # in-browser CAPTCHA tools: no sidecar, no CDP for the feature
   probe focus 60 smoke-focus.mjs ${focus[@]+"${focus[@]}"}
   [[ $(uname) == Linux ]] && probe sandbox 60 smoke-sandbox.mjs
   [[ $with == *,push,* ]] && probe push 150 smoke-push.mjs

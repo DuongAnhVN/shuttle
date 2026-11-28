@@ -26,6 +26,7 @@
 #include "chrome/browser/shuttle/avatar_cache.h"
 #include "chrome/browser/shuttle/browser_profile_registry.h"
 #include "chrome/browser/shuttle/browser_profile_router.h"
+#include "chrome/browser/shuttle/captcha_registry.h"
 #include "chrome/browser/shuttle/scope_auth.h"
 #include "chrome/browser/shuttle/mcp_tools.h"
 #include "chrome/browser/shuttle/page_tools.h"
@@ -516,6 +517,10 @@ void ShuttleService::HandleMcpRequest(const std::string& host,
       params ? params->FindDict("arguments") : nullptr;
   base::DictValue empty_arguments;
   ToolContext context{this, host};
+  // CAPTCHA native detection: keep the detectors of this Profile's leased
+  // tabs attached while rules are set (no-op otherwise). The Manager speaks
+  // MCP for everything around a challenge, so every request is the hook.
+  CaptchaRegistry::Get().ObserveProfile(this);
   if (const std::string working =
           arguments ? TouchSessionOf(*arguments) : std::string();
       !working.empty()) {
@@ -560,6 +565,23 @@ void ShuttleService::HandleMcpRequest(const std::string& host,
         kHttpOk, kJson,
         ErrorMessage(*id, kInvalidParams,
                      base::StrCat({"Unknown tool: ", name ? *name : ""})));
+    return;
+  }
+  // The CAPTCHA registry is browser-wide, while scoped callers in
+  // multi-profile mode are authorized only for their selected Profile.
+  // Keep these tools admin-only there; legacy single-profile behavior is
+  // unchanged.
+  constexpr std::string_view kBrowserWideCaptchaTools[] = {
+      "set-captcha-rules", "get-captcha-rules", "probe-captcha",
+      "wait-captcha-events", "get-captcha-challenge",
+      "solve-captcha-challenge", "cancel-captcha-challenge"};
+  if (BrowserProfileRouter::Get() && !admin &&
+      std::ranges::find(kBrowserWideCaptchaTools, *name) !=
+          std::ranges::end(kBrowserWideCaptchaTools)) {
+    ToolResult denied = ToolResult::Error(
+        "forbidden: CAPTCHA tools require an admin in multi-profile mode");
+    std::move(callback).Run(kHttpOk, kJson,
+                            ResultMessage(*id, std::move(denied).ToValue()));
     return;
   }
   tool->run(context, arguments ? *arguments : empty_arguments,

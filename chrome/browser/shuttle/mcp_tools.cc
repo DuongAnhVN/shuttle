@@ -31,6 +31,7 @@
 #include "chrome/browser/shuttle/agent_proxy.h"
 #include "chrome/browser/shuttle/browser_profile_registry.h"
 #include "chrome/browser/shuttle/browser_profile_router.h"
+#include "chrome/browser/shuttle/captcha_tools.h"
 #include "chrome/browser/shuttle/fingerprint_persona.h"
 #include "chrome/browser/shuttle/managed_profile_bootstrap.h"
 #include "chrome/browser/shuttle/network_access.h"
@@ -1701,6 +1702,56 @@ constexpr Tool kTools[] = {
      "Screenshot of a leased tab's viewport in CSS px, JPEG unless format "
      "png (also in the background). Cheaper than the screenshot page tool.",
      kCaptureArgs, &CaptureTab},
+    // CAPTCHA native detection (captcha-contract.md section 2; docs:
+    // tools/shuttle/docs/MCP.md). Same access class as create-agent and
+    // set-fingerprint. Handlers in captcha_tools.cc.
+    {"set-captcha-rules",
+     "Replace the whole CAPTCHA rule snapshot (revision, rules; the strict "
+     "wire format of the contract: puzzle-slide detection only, selectors "
+     "are data). An invalid snapshot is refused atomically and the old one "
+     "stays; a lower revision is stale-revision unless identical. Applied "
+     "to every agent tab from now on; live challenges of removed rules "
+     "retire.",
+     captcha_tools::kSetCaptchaRulesArgs, &captcha_tools::SetCaptchaRulesTool},
+    {"get-captcha-rules",
+     "Status of the applied CAPTCHA rule snapshot: {revision, applied, "
+     "enabledCount, lastError?}. The rules themselves stay in the Manager.",
+     captcha_tools::kGetCaptchaRulesArgs, &captcha_tools::GetCaptchaRulesTool},
+    {"probe-captcha",
+     "Run the CAPTCHA detector once over a leased tab's frames (detect "
+     "only, never acts): {targetId, frames:[{url, ruleId?, state: "
+     "\"none\"|\"candidate\"|\"ready\"|\"excluded\", missing?}]}.",
+     captcha_tools::kProbeCaptchaArgs, &captcha_tools::ProbeCaptchaTool},
+    {"wait-captcha-events",
+     "Long-poll the CAPTCHA event ring (256 kept): {events:[{seq, at, "
+     "type: \"challenge-ready\"|\"challenge-gone\"|\"solve-started\"|"
+     "\"solve-finished\", challengeId, targetId, ruleId, kind, outcome?, "
+     "reason?}], cursor, dropped?}. Returns at once when events after "
+     "`cursor` exist, else after waitMs (default 20000, max 30000) with an "
+     "empty list.",
+     captcha_tools::kWaitCaptchaEventsArgs,
+     &captcha_tools::WaitCaptchaEventsTool},
+    {"get-captcha-challenge",
+     "One challenge's captured state: {challengeId, targetId, ruleId, type, "
+     "stateRevision, capturedAt, images:{role:{mime,b64,width,height,source}}, "
+     "instruction|null, geometry:{role:{x,y,width,height}} (CSS px in the "
+     "frame viewport at capture), frameUrl}. Errors: challenge-not-found, "
+     "challenge-gone, challenge-capturing.",
+     captcha_tools::kChallengeIdArgs, &captcha_tools::GetCaptchaChallengeTool},
+    {"solve-captcha-challenge",
+     "Attempt one puzzle-slide solve {challengeId, stateRevision, "
+     "solution.slideXProportion, verifyTimeoutMs?, deadlineMs?}: rechecks "
+     "that the challenge is still fresh (stale answers with NO input sent), "
+     "drags the handle with trusted input (no DevTools) per the contract's "
+     "travel maths, and verifies the rule's success/failure. While it runs, "
+     "mutating page tools and CDP input on that tab answer "
+     "captcha-in-progress. Returns the Outcome.",
+     captcha_tools::kSolveCaptchaArgs, &captcha_tools::SolveCaptchaChallengeTool},
+    {"cancel-captcha-challenge",
+     "Abandon an in-flight solve of a challenge: releases the held mouse "
+     "button, unlocks the tab and answers the running solve (outcome error, "
+     "reason cancelled). {ok:true, state}.",
+     captcha_tools::kChallengeIdArgs, &captcha_tools::CancelCaptchaChallengeTool},
 };
 
 }  // namespace

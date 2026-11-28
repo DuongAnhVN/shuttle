@@ -26,6 +26,7 @@
 #include "chrome/browser/lifetime/browser_shutdown.h"
 #include "chrome/browser/shuttle/home_tab_manager.h"
 #include "chrome/browser/shuttle/browser_profile_router.h"
+#include "chrome/browser/shuttle/captcha_registry.h"
 #include "chrome/browser/shuttle/profile_registry.h"
 #include "chrome/browser/shuttle/scope_auth.h"
 #include "chrome/browser/shuttle/switches.h"
@@ -877,6 +878,7 @@ void SessionManager::Lease(content::WebContents* contents,
                            const std::string& session_id) {
   AgentTabLease::CreateForWebContents(contents, session_id,
                                       weak_factory_.GetWeakPtr());
+  CaptchaRegistry::Get().EnsureTabObserved(contents);
   RegisterTarget(contents, session_id);
 }
 
@@ -1083,6 +1085,9 @@ void SessionManager::AdoptTab(base::WeakPtr<content::WebContents> contents,
   if (contents->GetPrimaryMainFrame()->GetStoragePartition() ==
       profile_->GetStoragePartition(registry_->PartitionConfig(agent_id),
                                     /*can_create=*/false)) {
+    if (contents) {
+      CaptchaRegistry::Get().ForgetTab(contents.get());
+    }
     contents->RemoveUserData(AgentTabLease::UserDataKey());
     Lease(contents.get(), session_id);
     return;

@@ -18,6 +18,7 @@
 #include "base/task/single_thread_task_runner.h"
 #include "base/time/time.h"
 #include "chrome/browser/shuttle/browser_profile_router.h"
+#include "chrome/browser/shuttle/captcha_registry.h"
 #include "chrome/browser/shuttle/scope_auth.h"
 #include "chrome/browser/shuttle/session_manager.h"
 #include "content/public/browser/devtools_agent_host.h"
@@ -58,6 +59,17 @@ std::optional<int> LeadingId(std::string_view message) {
 std::string StringParam(const base::DictValue* params, std::string_view key) {
   const std::string* value = params ? params->FindString(key) : nullptr;
   return value ? *value : std::string();
+}
+
+// CAPTCHA guard (captcha-contract.md section 2, "Tab lock"): session CDP
+// input and navigation on a locked tab are refused while a challenge is
+// being solved. Everything else (reads, Target.*, Storage.*) is untouched.
+bool IsCaptchaGatedMethod(std::string_view name) {
+  if (name.starts_with("Input.")) {
+    return true;
+  }
+  return name == "Page.navigate" || name == "Page.reload" ||
+         name == "Page.goBack" || name == "Page.goForward";
 }
 
 std::string_view SameSiteName(net::CookieSameSite same_site) {
@@ -467,6 +479,48 @@ void SessionCdpFilter::OnClientMessage(std::string message) {
       return;
     }
   }
+  // CAPTCHA tab lock (contract section 2): while a solve runs on this tab,
+  // CDP input and page navigation are refused with captcha-in-progress and
+  // the current status; the same rule as for the mutating page tools.
+  if (IsCaptchaGatedMethod(name)) {
+    std::string locked_target = page_connection_ ? page_target_id_
+                                                 : StringParam(params,
+                                                               "targetId");
+    if (session) {
+      auto it = session_targets_.find(*session);
+      if (it != session_targets_.end()) {
+        locked_target = it->second;
+      } else {
+        // Flattened OOPIF sessions are not represented in session_targets_.
+        // Fail closed if any tab owned by this filter session is
+        // locked; DevToolsAgentHost does not provide a verified mapping from
+        // this flattened session id to its owning WebContents here.
+        for (const auto& [child_session, target_id] : session_targets_) {
+          (void)child_session;
+          if (const std::string s = CaptchaRegistry::Get().LockStatusOf(
+                  SessionManager::FindTab(target_id));
+              !s.empty()) {
+            SendError(*id, session,
+                      "Shuttle: captcha-in-progress: the CAPTCHA of this tab is in state " +
+                          s + " (try again after it finishes)");
+            return;
+          }
+        }
+      }
+    }
+    content::WebContents* locked = locked_target.empty()
+                                       ? nullptr
+                                       : SessionManager::FindTab(locked_target);
+    if (const std::string status =
+            CaptchaRegistry::Get().LockStatusOf(locked);
+        !status.empty()) {
+      SendError(*id, session,
+                "Shuttle: captcha-in-progress: the CAPTCHA of this tab is in "
+                "state " +
+                    status + " (try again after it finishes)");
+      return;
+    }
+  }
   to_agent_.Run(std::move(message));
 }
 
@@ -625,6 +679,12 @@ void SessionCdpFilter::HandleTargetEvent(const std::string& method,
       if (!parent && !child.empty() &&
           StringParam(info, "type") == "page") {
         session_targets_[child] = target_id;
+      }
+      if (parent && !child.empty()) {
+        if (auto p = session_targets_.find(*parent);
+            p != session_targets_.end()) {
+          session_targets_[child] = p->second;
+        }
       }
       if (scope_ &&
           (parent || page_connection_ || visible_.contains(target_id))) {

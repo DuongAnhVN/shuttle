@@ -357,12 +357,35 @@ source_set("browser_profile_router") {
   ]
 }
 
+# --- CAPTCHA native detection (branch sh/captcha-native-detect) -----------------
+# Contract: captcha-contract.md (wire format), tools/shuttle/docs/MCP.md. Pure
+# data: the strict rule-snapshot parser, URL matching, the puzzle-slide plan
+# maths and the JSON string-literal escaping that keeps selectors data. No
+# Profile, no content: unit tested alone (captcha_rules_unittest.cc).
+source_set("captcha_rules") {
+  sources = [
+    "captcha_rules.cc",
+    "captcha_rules.h",
+  ]
+  public_deps = [ "//base" ]
+}
+
 source_set("impl") {
   sources = [
     "agent_browser_sidecar.cc",
     "agent_browser_sidecar.h",
     "avatar_cache.cc",
     "avatar_cache.h",
+    "captcha_collector.cc",
+    "captcha_collector.h",
+    "captcha_detector.cc",
+    "captcha_detector.h",
+    "captcha_executor.cc",
+    "captcha_executor.h",
+    "captcha_registry.cc",
+    "captcha_registry.h",
+    "captcha_tools.cc",
+    "captcha_tools.h",
     "home_tab.cc",
     "home_tab_manager.cc",
     "home_tab_manager.h",
@@ -395,6 +418,7 @@ source_set("impl") {
     ":browser_owner_index",
     ":browser_profile_registry",
     ":browser_profile_router",
+    ":captcha_rules",
     ":fingerprint_persona",
     ":managed_profile_bootstrap",
     ":pref_names",
@@ -456,6 +480,7 @@ source_set("unit_tests") {
   testonly = true
   sources = [
     "browser_profile_registry_unittest.cc",
+    "captcha_rules_unittest.cc",
     "fingerprint_persona_unittest.cc",
     "scope_auth_unittest.cc",
   ]
@@ -463,6 +488,7 @@ source_set("unit_tests") {
     ":browser_admin_auth",
     ":browser_owner_index",
     ":browser_profile_registry",
+    ":captcha_rules",
     ":fingerprint_persona",
     "//base/version_info",
     ":scope_auth",
